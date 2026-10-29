@@ -152,10 +152,24 @@ export class AcDbChangeApplier {
    * notifies; undo/redo events are produced from the change list after the
    * replay completes.
    *
+   * Both of those properties are what make the collapse unobservable, so the
+   * collapse is restricted to that context. A caller outside a replay gets the
+   * per-change replay instead: with no transaction open the block table record
+   * notifies `entityErased` once per removal, and inside an open transaction it
+   * records the removals in change-list order. Fusing either of those into one
+   * bulk call is observable, and no production path asks for it.
+   *
    * @param ownerId - Object id of the block table record holding the objects
    * @param objects - Removed entities in recorded order; must not be empty
    */
   private applyRemoveBatch(ownerId: string, objects: AcDbObject[]): void {
+    if (!this.database.transactionManager.isApplyingUndoRedo()) {
+      for (const object of objects) {
+        this.applyRemove({ type: 'blockTableRecord', ownerId }, object)
+      }
+      return
+    }
+
     if (objects.length === 1) {
       this.applyRemove({ type: 'blockTableRecord', ownerId }, objects[0])
       return
