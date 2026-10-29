@@ -15,6 +15,28 @@ import { AcDbSysVarManager } from '../AcDbSysVarManager.js'
 import { AcDbChangeContainer, AcDbDatabaseChange } from './AcDbDatabaseChange.js'
 
 /**
+ * A remove change whose target is a block table record.
+ *
+ * Only these carry a container that owns an ordered entity array, and only
+ * these have a bulk removal API to collapse into.
+ */
+type AcDbBlockTableRecordRemove = AcDbDatabaseChange & {
+  kind: 'remove'
+  container: { type: 'blockTableRecord'; ownerId: string }
+}
+
+/**
+ * Returns true when `change` is a block-table-record removal.
+ *
+ * @param change - Single entry from a transaction or undo record
+ */
+function isBlockTableRecordRemove(
+  change: AcDbDatabaseChange
+): change is AcDbBlockTableRecordRemove {
+  return change.kind === 'remove' && change.container.type === 'blockTableRecord'
+}
+
+/**
  * Applies forward or inverse database changes for undo/redo operations.
  *
  * Structural changes (append/remove) and property snapshots (modify/sysvar)
@@ -33,12 +55,43 @@ export class AcDbChangeApplier {
    *
    * Used by redo and by applying the forward direction of an undo record.
    *
+   * Removals from one block table record are interchangeable, so a maximal run
+   * of consecutive ones is replayed with a single
+   * `AcDbBlockTableRecord.removeEntity(ids)` call. Every other change — a
+   * modify, a sysvar, an append, a removal from a different container — is an
+   * ordering barrier: it flushes the pending run and is then replayed in
+   * place, so the logical order of the record is unchanged. The change list
+   * itself is never reordered, which is what keeps the post-replay event
+   * stream identical — it is derived from that list, not from the execution
+   * order.
+   *
    * @param changes - Ordered list of changes recorded by {@link AcDbChangeRecorder}
    */
   applyForward(changes: AcDbDatabaseChange[]): void {
+    let runOwnerId: string | undefined
+    let runObjects: AcDbObject[] = []
+
+    const flush = () => {
+      if (runOwnerId !== undefined && runObjects.length > 0) {
+        this.applyRemoveBatch(runOwnerId, runObjects)
+      }
+      runOwnerId = undefined
+      runObjects = []
+    }
+
     for (const change of changes) {
+      if (isBlockTableRecordRemove(change)) {
+        if (runOwnerId !== change.container.ownerId) {
+          flush()
+          runOwnerId = change.container.ownerId
+        }
+        runObjects.push(change.object)
+        continue
+      }
+      flush()
       this.applyChange(change, true)
     }
+    flush()
   }
 
   /**
@@ -82,6 +135,35 @@ export class AcDbChangeApplier {
       case 'sysvar':
         this.applySysvar(change, forward)
         break
+    }
+  }
+
+  /**
+   * Removes a run of objects from one block table record in a single call.
+   *
+   * The result is defined by the surviving sequence only: stable compaction
+   * yields the same entity order whether the ids are removed one at a time or
+   * together, duplicate ids collapse in both forms, and ids that are already
+   * gone are silently skipped by `AcDbBlockTableRecord.removeEntity`.
+   *
+   * Nothing is recorded and nothing is dispatched here. During replay the
+   * block table record sees `isRecording()` false (there is no transaction on
+   * the stack) and `isApplyingUndoRedo()` true, so it neither records nor
+   * notifies; undo/redo events are produced from the change list after the
+   * replay completes.
+   *
+   * @param ownerId - Object id of the block table record holding the objects
+   * @param objects - Removed entities in recorded order; must not be empty
+   */
+  private applyRemoveBatch(ownerId: string, objects: AcDbObject[]): void {
+    if (objects.length === 1) {
+      this.applyRemove({ type: 'blockTableRecord', ownerId }, objects[0])
+      return
+    }
+
+    const btr = this.database.tables.blockTable.getIdAt(ownerId)
+    if (btr) {
+      btr.removeEntity(objects.map(object => object.objectId))
     }
   }
 
