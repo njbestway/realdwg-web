@@ -1,5 +1,21 @@
 # @mlightcad/libredwg-converter
 
+## 3.15.18
+
+### Patch Changes
+
+- fix: keeps entities on inactive paper-space layouts when opening DXF. ezdxf and AutoCAD store geometry for layouts other than the active \*Paper_Space block in the BLOCKS section, and the importer skipped every paper-space block, so those entities never appeared. Non-current layouts now keep their geometry and the drawing opens with the full paper-space content
+- Updated dependencies
+  - @mlightcad/data-model@1.15.18
+
+## 3.15.17
+
+### Patch Changes
+
+- fix: restores multi-step redo so consecutive redo operations replay every undone record. `AcDbUndoStack.pushUndo()` reinstates a record without clearing the redo stack, and the transaction manager `redo()` uses it, so `canRedo()` stays true until the redo history is exhausted while new edits still invalidate it
+- Updated dependencies
+  - @mlightcad/data-model@1.15.17
+
 ## 3.15.16
 
 ### Patch Changes
