@@ -75,6 +75,15 @@ export class AcDbChangeRecorder {
    */
   private readonly cancelledStructurals = new Set<AcDbDatabaseChange>()
 
+  /** Modify entries whose `before` was supplied by the caller (phase 2.10). */
+  private _sharedBeforeSnapshotCount = 0
+
+  /** Modify entries that cloned their own `before`. */
+  private _beforeSnapshotClones = 0
+
+  /** `after` snapshots taken by {@link finalize}. */
+  private _afterSnapshotClones = 0
+
   /**
    * Returns the changes recorded so far in this transaction.
    *
@@ -108,6 +117,11 @@ export class AcDbChangeRecorder {
     for (const change of other.getChanges()) {
       this.mergeChange(change)
     }
+    // A merged child no longer exists as a transaction, so its per-transaction
+    // counters have to roll up here or the phase 2.10 metrics would lose them.
+    this._sharedBeforeSnapshotCount += other.sharedBeforeSnapshotCount
+    this._beforeSnapshotClones += other.beforeSnapshotClones
+    this._afterSnapshotClones += other.afterSnapshotClones
   }
 
   /**
@@ -116,8 +130,12 @@ export class AcDbChangeRecorder {
    * Only the first modify entry per {@link AcDbObject.objectId} is kept.
    *
    * @param object - Object whose state should be restorable on abort/undo
+   * @param beforeSnapshot - Optional already-taken snapshot of `object` that the
+   *   caller owns. `AcDbTransaction` passes the rollback snapshot here so the
+   *   transaction keeps one before state instead of two; the recorder then never
+   *   clones. Omitted by every other caller, which keeps the previous behaviour.
    */
-  recordModify(object: AcDbObject): void {
+  recordModify(object: AcDbObject, beforeSnapshot?: AcDbObject): void {
     const objectId = object.objectId
     if (this.modifyById.has(objectId)) {
       return
@@ -125,10 +143,36 @@ export class AcDbChangeRecorder {
     const change: AcDbModifyChange = {
       kind: 'modify',
       objectId,
-      before: object.clonePreservingIdentity()
+      before: beforeSnapshot ?? object.clonePreservingIdentity()
+    }
+    if (beforeSnapshot) {
+      this._sharedBeforeSnapshotCount++
+    } else {
+      this._beforeSnapshotClones++
     }
     this.modifyById.set(objectId, change)
     this.changes.push(change)
+  }
+
+  /**
+   * Number of modify entries whose `before` was supplied by the caller.
+   *
+   * Phase 2.10 diagnostic: each of these is one deep clone the transaction did
+   * not have to perform, because it reused the snapshot it already held for
+   * rollback.
+   */
+  get sharedBeforeSnapshotCount(): number {
+    return this._sharedBeforeSnapshotCount
+  }
+
+  /** Number of modify entries that had to clone their own `before`. */
+  get beforeSnapshotClones(): number {
+    return this._beforeSnapshotClones
+  }
+
+  /** Number of `after` snapshots taken by {@link finalize}. */
+  get afterSnapshotClones(): number {
+    return this._afterSnapshotClones
   }
 
   /**
@@ -217,6 +261,7 @@ export class AcDbChangeRecorder {
         const object = database.getObjectById(change.objectId)
         if (object) {
           change.after = object.clonePreservingIdentity()
+          this._afterSnapshotClones++
         }
       } else if (change.kind === 'sysvar') {
         change.after = this.getSysvarValue(database, change.name)

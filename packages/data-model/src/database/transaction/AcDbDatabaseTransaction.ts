@@ -1,6 +1,6 @@
 import { AcDbObject, AcDbObjectId } from '../../base/index.js'
 import { AcDbDatabase } from '../AcDbDatabase.js'
-import { AcDbTransaction } from './AcDbTransaction.js'
+import { AcDbTransaction, AcDbTransactionOptions } from './AcDbTransaction.js'
 
 /**
  * Database-bound transaction with object lookup through {@link AcDbDatabase}.
@@ -11,9 +11,13 @@ import { AcDbTransaction } from './AcDbTransaction.js'
 export class AcDbDatabaseTransaction extends AcDbTransaction {
   /**
    * @param database - Database whose objects are opened and recorded
+   * @param options - Snapshot-sharing experiment knobs forwarded to the base class
    */
-  constructor(private readonly database: AcDbDatabase) {
-    super()
+  constructor(
+    private readonly database: AcDbDatabase,
+    options?: AcDbTransactionOptions
+  ) {
+    super(options)
   }
 
   /**

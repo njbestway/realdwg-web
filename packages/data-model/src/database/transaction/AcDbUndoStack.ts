@@ -1,3 +1,4 @@
+import type { AcDbDatabaseChange } from './AcDbDatabaseChange.js'
 import { AcDbUndoRecord } from './AcDbUndoRecord.js'
 
 /**
@@ -93,6 +94,51 @@ export class AcDbUndoStack {
    */
   canRedo(): boolean {
     return this.redoRecords.length > 0
+  }
+
+  /**
+   * Number of change entries retained by both stacks.
+   *
+   * Phase 2.10 diagnostic: this is the part of retained memory that undo
+   * history owns on purpose, so it can be reported separately from anything
+   * that should have been released but was not.
+   */
+  get retainedChangeCount(): number {
+    let total = 0
+    for (const record of this.undoRecords) total += record.changes.length
+    for (const record of this.redoRecords) total += record.changes.length
+    return total
+  }
+
+  /** Change entries retained by the undo stack alone. */
+  get undoChangeCount(): number {
+    let total = 0
+    for (const record of this.undoRecords) total += record.changes.length
+    return total
+  }
+
+  /** Change entries retained by the redo stack alone. */
+  get redoChangeCount(): number {
+    let total = 0
+    for (const record of this.redoRecords) total += record.changes.length
+    return total
+  }
+
+  /**
+   * Visits every change entry retained by both stacks.
+   *
+   * Used by the phase 2.10 byte estimate: the estimator has to look at every
+   * snapshot the history holds, and the stacks are otherwise opaque.
+   *
+   * @param visit - Called once per retained change, undo stack first
+   */
+  forEachChange(visit: (change: AcDbDatabaseChange) => void): void {
+    for (const record of this.undoRecords) {
+      for (const change of record.changes) visit(change)
+    }
+    for (const record of this.redoRecords) {
+      for (const change of record.changes) visit(change)
+    }
   }
 
   /**

@@ -96,10 +96,13 @@ export {
   AcDbChangeRecorder,
   AcDbDatabaseTransaction,
   AcDbDatabaseTransactionManager,
+  AcDbSnapshotIntegrityProbe,
   AcDbTransaction,
   AcDbTransactionManager,
   AcDbUndoStack,
   acdbCollectChangeEntities,
+  acdbCreateSnapshotSharingMetrics,
+  acdbFingerprintSnapshot,
   AcDbOpenDatabaseError,
   AcDbTextStyleTable,
   AcDbTextStyleTableRecord,
@@ -154,6 +157,13 @@ export type {
   AcDbViewportTableRecordAttrs,
   AcDbChangeContainer,
   AcDbDatabaseChange,
+  AcDbSnapshotIntegrityBoundary,
+  AcDbSnapshotIntegrityMetrics,
+  AcDbSnapshotIntegrityProbeOptions,
+  AcDbSnapshotIntegrityViolation,
+  AcDbSnapshotSharingMetrics,
+  AcDbSnapshotSizeEstimator,
+  AcDbTransactionOptions,
   AcDbUndoRecord
 } from './database/index.js'
 export {

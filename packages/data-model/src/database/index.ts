@@ -92,17 +92,27 @@ export {
   AcDbChangeRecorder,
   AcDbDatabaseTransaction,
   AcDbDatabaseTransactionManager,
+  AcDbSnapshotIntegrityProbe,
   AcDbTransaction,
   AcDbTransactionManager,
   AcDbUndoStack,
   acdbAreChangeContainersEqual,
   acdbCollectChangeEntities,
-  acdbCollectDictionaryChanges
+  acdbCollectDictionaryChanges,
+  acdbCreateSnapshotSharingMetrics,
+  acdbFingerprintSnapshot
 } from './transaction/index.js'
 export type {
   AcDbChangeContainer,
   AcDbDatabaseChange,
   AcDbDictionaryChangeEntry,
+  AcDbSnapshotIntegrityBoundary,
+  AcDbSnapshotIntegrityMetrics,
+  AcDbSnapshotIntegrityProbeOptions,
+  AcDbSnapshotIntegrityViolation,
+  AcDbSnapshotSharingMetrics,
+  AcDbSnapshotSizeEstimator,
+  AcDbTransactionOptions,
   AcDbUndoRecord
 } from './transaction/index.js'
 export { AcDbTextStyleTable } from './AcDbTextStyleTable.js'

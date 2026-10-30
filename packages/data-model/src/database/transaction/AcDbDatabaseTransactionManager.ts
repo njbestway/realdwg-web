@@ -10,6 +10,15 @@ import {
 } from './AcDbChangeApplier.js'
 import { AcDbChangeContainer } from './AcDbDatabaseChange.js'
 import { AcDbDatabaseTransaction } from './AcDbDatabaseTransaction.js'
+import {
+  AcDbSnapshotIntegrityMetrics,
+  AcDbSnapshotIntegrityProbe
+} from './AcDbSnapshotSharingIntegrity.js'
+import {
+  acdbCreateSnapshotSharingMetrics,
+  AcDbSnapshotSharingMetrics,
+  AcDbSnapshotSizeEstimator
+} from './AcDbSnapshotSharingMetrics.js'
 import { AcDbUndoStack } from './AcDbUndoStack.js'
 
 /**
@@ -48,6 +57,37 @@ export class AcDbDatabaseTransactionManager {
   strictMode = false
 
   /**
+   * Phase 2.10 experiment switch: reuse the rollback snapshot as the undo
+   * `before` snapshot.
+   *
+   * While false (the default) a first write clones twice, exactly as in
+   * `1.15.16-perf.3`. The A/B harness flips it per session so both arms run the
+   * same build. It is read once, when a transaction is created, so flipping it
+   * never changes a transaction that is already open.
+   */
+  snapshotSharing = false
+
+  /**
+   * Optional per-snapshot byte estimate, forwarded to every new transaction.
+   *
+   * Undefined by default so the production path does no estimation work.
+   */
+  snapshotSizeEstimator: AcDbSnapshotSizeEstimator | undefined
+
+  /** Accumulated phase 2.10 counters; see {@link getSnapshotSharingMetrics}. */
+  private readonly _snapshotMetrics = acdbCreateSnapshotSharingMetrics()
+
+  /**
+   * Optional shared-snapshot integrity probe (phase 2.11, task A2).
+   *
+   * Attach one in development and test builds to prove that a snapshot shared
+   * between the rollback map and the undo record is never written. Undefined by
+   * default, which is what keeps the production performance path free of
+   * fingerprinting: the kernel only reads this field.
+   */
+  snapshotIntegrityProbe: AcDbSnapshotIntegrityProbe | undefined
+
+  /**
    * Creates a transaction manager for one database.
    *
    * @param database - Database whose mutations and undo history are managed
@@ -64,7 +104,11 @@ export class AcDbDatabaseTransactionManager {
    * @returns The newly created transaction
    */
   startTransaction(): AcDbDatabaseTransaction {
-    const tr = new AcDbDatabaseTransaction(this.database)
+    const tr = new AcDbDatabaseTransaction(this.database, {
+      shareBeforeSnapshot: this.snapshotSharing,
+      estimateSnapshotBytes: this.snapshotSizeEstimator,
+      integrityProbe: this.snapshotIntegrityProbe
+    })
     this.transactionStack.push(tr)
     return tr
   }
@@ -128,6 +172,7 @@ export class AcDbDatabaseTransactionManager {
    * @throws Error if no transaction is active
    */
   commitTransaction(): void {
+    const startedAt = performance.now()
     const tr = this.transactionStack.pop()
     if (!tr) {
       throw new Error('No active transaction to commit.')
@@ -136,18 +181,32 @@ export class AcDbDatabaseTransactionManager {
     if (this.transactionStack.length > 0) {
       const parent = this.transactionStack[this.transactionStack.length - 1]
       parent.recorder.mergeFrom(tr.recorder)
+      // The child's recorder counters just rolled up into the parent, so only
+      // the transaction-level counters are absorbed here; absorbing the
+      // recorder's too would count the merged entries twice.
+      this.absorbTransactionCounters(tr, false)
       tr.commit()
+      this._snapshotMetrics.commitMs += performance.now() - startedAt
       return
     }
 
+    const finalizeStartedAt = performance.now()
     tr.recorder.finalize(this.database)
+    this._snapshotMetrics.finalizeMs += performance.now() - finalizeStartedAt
+
+    // A2: the shared snapshot is about to become undo history, so this is the
+    // last moment where a write to it could still be caught before it is read.
+    tr.verifySharedSnapshots('commit')
+
     const changes = tr.recorder.getChanges()
+    this.absorbTransactionCounters(tr, true)
     tr.commit()
 
     if (changes.length > 0) {
       this.dispatchCommitEvents(changes)
       this.enqueueUndoChanges(changes)
     }
+    this._snapshotMetrics.commitMs += performance.now() - startedAt
   }
 
   /**
@@ -156,12 +215,19 @@ export class AcDbDatabaseTransactionManager {
    * @throws Error if no transaction is active
    */
   abortTransaction(): void {
+    const startedAt = performance.now()
     const tr = this.transactionStack.pop()
     if (!tr) {
       throw new Error('No active transaction to abort.')
     }
 
     const changes = [...tr.recorder.getChanges()]
+    // Read the counters before `tr.abort()`, which clears the recorder.
+    this.absorbTransactionCounters(tr, true)
+
+    // A2: rollback reads every `originalStates` snapshot, so any write to a
+    // shared one has to be reported before `restoreFrom` consumes it.
+    tr.verifySharedSnapshots('abort')
 
     this.database.beginEventBatch()
     this._applyingUndoRedo = true
@@ -174,6 +240,7 @@ export class AcDbDatabaseTransactionManager {
       this._applyingUndoRedo = false
       this.database.endEventBatch()
     }
+    this._snapshotMetrics.abortMs += performance.now() - startedAt
   }
 
   /**
@@ -229,6 +296,8 @@ export class AcDbDatabaseTransactionManager {
       return false
     }
 
+    const startedAt = performance.now()
+    this.verifyUndoPayload(record.changes, 'undo')
     this.database.beginEventBatch()
     this._applyingUndoRedo = true
     try {
@@ -238,6 +307,7 @@ export class AcDbDatabaseTransactionManager {
       this._applyingUndoRedo = false
       this.database.endEventBatch()
     }
+    this._snapshotMetrics.undoMs += performance.now() - startedAt
 
     this.undoStack.pushRedo(record)
     return true
@@ -254,6 +324,8 @@ export class AcDbDatabaseTransactionManager {
       return false
     }
 
+    const startedAt = performance.now()
+    this.verifyUndoPayload(record.changes, 'redo')
     this.database.beginEventBatch()
     this._applyingUndoRedo = true
     try {
@@ -263,6 +335,7 @@ export class AcDbDatabaseTransactionManager {
       this._applyingUndoRedo = false
       this.database.endEventBatch()
     }
+    this._snapshotMetrics.redoMs += performance.now() - startedAt
 
     this.undoStack.pushUndo(record)
     return true
@@ -287,6 +360,138 @@ export class AcDbDatabaseTransactionManager {
    */
   clearUndoStack(): void {
     this.undoStack.clear()
+  }
+
+  /**
+   * Phase 2.10 counters accumulated since {@link resetSnapshotSharingMetrics}.
+   *
+   * The retained fields are sampled at call time rather than accumulated, so a
+   * caller can watch the undo history's own footprint separately from the
+   * clone counts. Byte estimates stay 0 unless
+   * {@link snapshotSizeEstimator} is set.
+   *
+   * @returns A copy; mutating it does not affect the manager
+   */
+  getSnapshotSharingMetrics(): AcDbSnapshotSharingMetrics {
+    const metrics = this._snapshotMetrics
+    metrics.retainedUndoChanges = this.undoStack.retainedChangeCount
+    metrics.retainedSnapshotBytesEstimated = this.estimateRetainedSnapshotBytes()
+    return { ...metrics }
+  }
+
+  /** Zeroes every counter without touching the undo history. */
+  resetSnapshotSharingMetrics(): void {
+    Object.assign(this._snapshotMetrics, acdbCreateSnapshotSharingMetrics())
+  }
+
+  /**
+   * Shared-snapshot integrity counters (phase 2.11, task A2).
+   *
+   * `enabled: false` when no probe is attached, which is the production
+   * default. `copyOnWriteCount === 0` from
+   * {@link getSnapshotSharingMetrics} is not evidence that a shared snapshot
+   * stayed unchanged; `checks` and `violations` are.
+   *
+   * @returns A copy; mutating it does not affect the probe
+   */
+  getSnapshotIntegrityMetrics(): AcDbSnapshotIntegrityMetrics {
+    if (!this.snapshotIntegrityProbe) {
+      return {
+        enabled: false,
+        watchedSnapshots: 0,
+        checks: 0,
+        checkedBoundaries: 0,
+        violations: 0,
+        evictedSnapshots: 0,
+        lastBoundary: null,
+        lastPassViolations: 0,
+        recentViolations: []
+      }
+    }
+    return this.snapshotIntegrityProbe.getMetrics()
+  }
+
+  /**
+   * Re-fingerprints the `before` snapshots of one undo record.
+   *
+   * Undo and redo both read `change.before` through `restoreFrom`, so a write
+   * to a shared snapshot shows up here before it can corrupt the replay. Only
+   * object changes carry an `AcDbObject` payload; attribute changes are
+   * skipped.
+   *
+   * @param changes - Changes of the record about to be replayed
+   * @param boundary - `undo` or `redo`
+   */
+  private verifyUndoPayload(
+    changes: readonly import('./AcDbDatabaseChange.js').AcDbDatabaseChange[],
+    boundary: 'undo' | 'redo'
+  ): void {
+    const probe = this.snapshotIntegrityProbe
+    if (!probe || !this.snapshotSharing) return
+
+    let violations = 0
+    for (const change of changes) {
+      if (change.kind !== 'modify') continue
+      const before = change.before
+      if (!(before instanceof AcDbObject)) continue
+      if (!probe.check(change.objectId, before, boundary)) violations++
+    }
+    probe.noteBoundary(boundary, violations)
+  }
+
+  /**
+   * Adds caller-measured transform time to the metrics.
+   *
+   * The kernel never sees the transform itself — a caller mutates the opened
+   * object — so the harness reports its own measurement here instead of the
+   * kernel inventing one.
+   *
+   * @param ms - Milliseconds spent transforming in the measured window
+   */
+  addSnapshotTransformMs(ms: number): void {
+    this._snapshotMetrics.transformMs += ms
+  }
+
+  /**
+   * Folds one transaction's counters into the accumulated metrics.
+   *
+   * @param tr - Transaction that is leaving the stack
+   * @param includeRecorder - False for a nested commit, whose recorder counters
+   *   have already rolled up into the parent via `mergeFrom`
+   */
+  private absorbTransactionCounters(
+    tr: AcDbDatabaseTransaction,
+    includeRecorder: boolean
+  ): void {
+    const metrics = this._snapshotMetrics
+    metrics.openedForWrite += tr.openedForWrite
+    metrics.uniqueModifiedObjects += tr.uniqueModifiedObjects
+    metrics.rollbackSnapshotClones += tr.rollbackSnapshotClones
+    metrics.snapshotBytesEstimated += tr.snapshotBytes
+    metrics.openForWriteMs += tr.snapshotCloneMs
+    metrics.recordModifyMs += tr.recordModifyMs
+
+    if (!includeRecorder) return
+    metrics.beforeSnapshotClones += tr.recorder.beforeSnapshotClones
+    metrics.afterSnapshotClones += tr.recorder.afterSnapshotClones
+    metrics.sharedBeforeSnapshotCount += tr.recorder.sharedBeforeSnapshotCount
+  }
+
+  /** Estimated bytes of every snapshot the undo/redo stacks currently hold. */
+  private estimateRetainedSnapshotBytes(): number {
+    const estimate = this.snapshotSizeEstimator
+    if (!estimate) return 0
+
+    let total = 0
+    this.undoStack.forEachChange(change => {
+      if (change.kind === 'modify') {
+        if (change.before) total += estimate(change.before)
+        if (change.after) total += estimate(change.after)
+      } else if (change.kind !== 'sysvar') {
+        total += estimate(change.object)
+      }
+    })
+    return total
   }
 
   /**
