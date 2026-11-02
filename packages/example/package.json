@@ -1,6 +1,6 @@
 {
   "name": "@mlightcad/realdwg-web-example",
-  "version": "0.15.18",
+  "version": "0.15.20",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -45,6 +45,7 @@
     "@mlightcad/libredwg-converter": "workspace:*"
   },
   "devDependencies": {
+    "vite": "^6.4.3",
     "vite-plugin-static-copy": "^3.1.1"
   }
 }

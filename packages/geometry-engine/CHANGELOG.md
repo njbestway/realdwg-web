@@ -1,5 +1,21 @@
 # @mlightcad/geometry-engine
 
+## 3.15.20
+
+### Patch Changes
+
+- feat: records whether a sub-entity's colour was authored ByLayer on graphic traits, so INSERT layer-0 inheritance can resolve ByLayer colours against the INSERT layer while leaving explicit ACI colours untouched. The resolved `color` value is unchanged, so renderers draw exactly as before.
+- Updated dependencies
+  - @mlightcad/common@1.15.20
+
+## 3.15.19
+
+### Patch Changes
+
+- fix: honors per-entity DSTYLE overrides on dimensions, leaders, and tolerance frames so Properties palette edits survive import. Leaders expose their DXF fields, draw arrowheads and hook lines from their own flags, and paint the line and generated arrow from DIMCLRD instead of the layer color. DIMLDRBLK handles resolve to block names, and a DIMDSEP override no longer splices its ASCII code into the measurement text
+- Updated dependencies
+  - @mlightcad/common@1.15.19
+
 ## 3.15.18
 
 ### Patch Changes
