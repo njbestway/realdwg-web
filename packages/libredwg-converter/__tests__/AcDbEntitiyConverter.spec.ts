@@ -464,6 +464,85 @@ describe('libredwg AcDbEntityConverter', () => {
     expect((result as AcDbMText).lineSpacingFactor).toBeCloseTo(1)
   })
 
+  it('converts MTEXT background mask fields from LibreDWG', () => {
+    acdbHostApplicationServices().workingDatabase = new AcDbDatabase()
+    const converter = new AcDbEntityConverter()
+
+    const colorFill = converter.convert({
+      type: 'MTEXT',
+      text: 'Masked',
+      textHeight: 2,
+      rectWidth: 10,
+      insertionPoint: { x: 0, y: 0, z: 0 },
+      backgroundFill: 1,
+      backgroundFillColor: 0x336699,
+      fillBoxScale: 1.5,
+      backgroundFillTransparency: 200
+    } as any) as AcDbMText
+
+    expect(colorFill.backgroundFill).toBe(true)
+    expect(colorFill.useBackgroundColor).toBe(false)
+    expect(colorFill.backgroundFillColor).toBe(0x336699)
+    expect(colorFill.backgroundScaleFactor).toBeCloseTo(1.5)
+    expect(colorFill.backgroundFillTransparency).toBe(200)
+
+    const windowFill = converter.convert({
+      type: 'MTEXT',
+      text: 'Window',
+      textHeight: 2,
+      rectWidth: 10,
+      insertionPoint: { x: 0, y: 0, z: 0 },
+      backgroundFill: 2,
+      fillBoxScale: 1.25
+    } as any) as AcDbMText
+
+    expect(windowFill.backgroundFill).toBe(true)
+    expect(windowFill.useBackgroundColor).toBe(true)
+    expect(windowFill.backgroundScaleFactor).toBeCloseTo(1.25)
+
+    const canvasFill = converter.convert({
+      type: 'MTEXT',
+      text: 'Canvas',
+      textHeight: 2,
+      rectWidth: 10,
+      insertionPoint: { x: 0, y: 0, z: 0 },
+      backgroundFill: 3,
+      fillBoxScale: 1.5,
+      // LibreDWG ByLayer CMC placeholder — must not become the fill colour.
+      backgroundFillColor: 0xc0000000
+    } as any) as AcDbMText
+
+    expect(canvasFill.backgroundFill).toBe(true)
+    expect(canvasFill.useBackgroundColor).toBe(true)
+    expect(canvasFill.backgroundScaleFactor).toBeCloseTo(1.5)
+    // Default grey kept; 0xC0000000 must not overwrite it.
+    expect(canvasFill.backgroundFillColor).toBe(0xc8c8c8)
+
+    // Older libredwg-web could leave packed CMC in colour-fill mode.
+    const aciFill = converter.convert({
+      type: 'MTEXT',
+      text: 'ACI',
+      textHeight: 2,
+      rectWidth: 10,
+      insertionPoint: { x: 0, y: 0, z: 0 },
+      backgroundFill: 1,
+      backgroundFillColor: 0xc3000001 // kByACI + index 1
+    } as any) as AcDbMText
+    expect(aciFill.useBackgroundColor).toBe(false)
+    expect(aciFill.backgroundFillColor).toBe(1)
+
+    const rgbFill = converter.convert({
+      type: 'MTEXT',
+      text: 'RGB',
+      textHeight: 2,
+      rectWidth: 10,
+      insertionPoint: { x: 0, y: 0, z: 0 },
+      backgroundFill: 1,
+      backgroundFillColor: 0xc2112233 // kByColor + RGB
+    } as any) as AcDbMText
+    expect(rgbFill.backgroundFillColor).toBe(0x112233)
+  })
+
   it('keeps tapered LWPOLYLINE vertex widths (valve triangles)', () => {
     acdbHostApplicationServices().workingDatabase = new AcDbDatabase()
     const converter = new AcDbEntityConverter()
