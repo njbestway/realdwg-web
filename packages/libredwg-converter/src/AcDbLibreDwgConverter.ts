@@ -18,6 +18,7 @@ import {
   AcDbDimZeroSuppression,
   AcDbDimZeroSuppressionAngular,
   AcDbEntity,
+  AcDbGroup,
   acdbHexStringsToBytes,
   acdbImportDynBlockMetadata,
   AcDbLayerFilterPersistSource,
@@ -52,7 +53,8 @@ import {
   DwgCommonObject,
   DwgCommonTableEntry,
   DwgDatabase,
-  DwgEntity
+  DwgEntity,
+  DwgGroupObject
 } from '@mlightcad/libredwg-web'
 
 import { AcDbEntityConverter } from './AcDbEntitiyConverter.js'
@@ -72,7 +74,9 @@ import {
 const MODEL_SPACE = '*MODEL_SPACE'
 
 /**
- * Database converter for DWG files based on [libredwg-web](https://github.com/mlight-lee/libredwg-web).
+ * Database converter for DWG/DXF files based on
+ * [libredwg-web](https://github.com/mlightcad/libredwg-web).
+ * DXF import requires libredwg-web ≥ 0.8.6 (WASM built with DXF read enabled).
  */
 export class AcDbLibreDwgConverter extends AcDbDatabaseConverter<DwgDatabase> {
   constructor(config: AcDbDatabaseConverterConfig = {}) {
@@ -685,6 +689,7 @@ export class AcDbLibreDwgConverter extends AcDbDatabaseConverter<DwgDatabase> {
     this.processMLeaderObjectContextData(model, db)
     this.processMTextAttributeObjectContextData(model, db)
     this.processXRecords(model, db)
+    this.processGroups(model, db)
     this.processLayouts(model, db)
     this.processImageDefs(model, db)
     this.processLayerFilters(model, db)
@@ -1123,6 +1128,75 @@ export class AcDbLibreDwgConverter extends AcDbDatabaseConverter<DwgDatabase> {
     for (const xrecord of xrecords) {
       const dbXrecord = objectConverter.convertXRecord(xrecord)
       if (dbXrecord.objectId) xrecordDict.setAt(dbXrecord.objectId, dbXrecord)
+    }
+  }
+
+  /**
+   * Imports GROUP objects into `db.objects.group`, then renames entries from
+   * the ACAD_GROUP dictionary so ObjectARX-style names are available.
+   */
+  private processGroups(model: DwgDatabase, db: AcDbDatabase) {
+    const groups =
+      model.objects.GROUP ??
+      this.optionalObjectArray<DwgGroupObject>(model, 'GROUP')
+    if (!groups?.length) return
+
+    const groupDict = db.objects.group
+    const objectConverter = new AcDbObjectConverter()
+    const byHandle = new Map<string, AcDbGroup>()
+    const normalize = (handle?: string | number) =>
+      handle == null || handle === '' || handle === 0
+        ? ''
+        : String(handle).trim().toUpperCase()
+
+    for (const group of groups) {
+      const dbGroup = objectConverter.convertGroup(group)
+      if (!dbGroup.objectId) continue
+      groupDict.setAt(dbGroup.objectId, dbGroup)
+      byHandle.set(normalize(dbGroup.objectId), dbGroup)
+    }
+
+    // Resolve ACAD_GROUP dictionary entry names → group.name / dict keys.
+    let acadGroupHandle = ''
+    for (const dict of model.objects.DICTIONARY ?? []) {
+      const entries = dict.entries ?? {}
+      if (entries.ACAD_GROUP) {
+        acadGroupHandle = normalize(entries.ACAD_GROUP)
+        break
+      }
+    }
+    if (!acadGroupHandle) return
+
+    const acadGroupDict = (model.objects.DICTIONARY ?? []).find(
+      dict => normalize(dict.handle) === acadGroupHandle
+    )
+    if (!acadGroupDict?.entries) return
+
+    for (const [entryName, entryHandle] of Object.entries(
+      acadGroupDict.entries
+    )) {
+      const handle = normalize(entryHandle)
+      const group = byHandle.get(handle)
+      if (!group || !entryName) continue
+      let storedKey: string | undefined
+      for (const [key, existing] of groupDict.entries()) {
+        if (normalize(existing.objectId) === handle) {
+          storedKey = key
+          break
+        }
+      }
+      const occupied = groupDict.getAt(entryName)
+      if (occupied && occupied !== group) {
+        // Name collision with a different group — leave handle key and name.
+        continue
+      }
+      if (storedKey != null && storedKey !== entryName) {
+        groupDict.remove(storedKey)
+        groupDict.setAt(entryName, group)
+      } else if (!occupied) {
+        groupDict.setAt(entryName, group)
+      }
+      group.name = entryName
     }
   }
 
