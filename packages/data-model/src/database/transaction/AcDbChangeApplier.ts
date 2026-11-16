@@ -15,25 +15,32 @@ import { AcDbSysVarManager } from '../AcDbSysVarManager.js'
 import { AcDbChangeContainer, AcDbDatabaseChange } from './AcDbDatabaseChange.js'
 
 /**
- * A remove change whose target is a block table record.
+ * A structural change that deletes its object from a block table record.
  *
- * Only these carry a container that owns an ordered entity array, and only
- * these have a bulk removal API to collapse into.
+ * A `remove` deletes in the forward direction and an `append` deletes in the
+ * inverse direction. Only block table record containers own an ordered entity
+ * array, and only they have a bulk removal API to collapse a run into.
  */
-type AcDbBlockTableRecordRemove = AcDbDatabaseChange & {
-  kind: 'remove'
+type AcDbBlockTableRecordDeletion = AcDbDatabaseChange & {
+  kind: 'append' | 'remove'
   container: { type: 'blockTableRecord'; ownerId: string }
 }
 
 /**
- * Returns true when `change` is a block-table-record removal.
+ * Returns true when `change` replays as a block-table-record deletion.
  *
  * @param change - Single entry from a transaction or undo record
+ * @param forward - Direction being replayed
  */
-function isBlockTableRecordRemove(
-  change: AcDbDatabaseChange
-): change is AcDbBlockTableRecordRemove {
-  return change.kind === 'remove' && change.container.type === 'blockTableRecord'
+function isBlockTableRecordDeletion(
+  change: AcDbDatabaseChange,
+  forward: boolean
+): change is AcDbBlockTableRecordDeletion {
+  return (
+    (change.kind === 'append' || change.kind === 'remove') &&
+    change.container.type === 'blockTableRecord' &&
+    forward === (change.kind === 'remove')
+  )
 }
 
 /**
@@ -43,6 +50,12 @@ function isBlockTableRecordRemove(
  * are replayed against a live {@link AcDbDatabase} instance.
  */
 export class AcDbChangeApplier {
+  /** Owner of {@link pendingRemovals}. */
+  private pendingRemoveOwnerId?: string
+
+  /** Consecutive deletions from one block table record, in replay order. */
+  private pendingRemovals: AcDbObject[] = []
+
   /**
    * Creates an applier bound to one database.
    *
@@ -55,7 +68,7 @@ export class AcDbChangeApplier {
    *
    * Used by redo and by applying the forward direction of an undo record.
    *
-   * Removals from one block table record are interchangeable, so a maximal run
+   * Deletions from one block table record are interchangeable, so a maximal run
    * of consecutive ones is replayed with a single
    * `AcDbBlockTableRecord.removeEntity(ids)` call. Every other change — a
    * modify, a sysvar, an append, a removal from a different container — is an
@@ -68,42 +81,31 @@ export class AcDbChangeApplier {
    * @param changes - Ordered list of changes recorded by {@link AcDbChangeRecorder}
    */
   applyForward(changes: AcDbDatabaseChange[]): void {
-    let runOwnerId: string | undefined
-    let runObjects: AcDbObject[] = []
-
-    const flush = () => {
-      if (runOwnerId !== undefined && runObjects.length > 0) {
-        this.applyRemoveBatch(runOwnerId, runObjects)
+    try {
+      for (const change of changes) {
+        this.applyChange(change, true)
       }
-      runOwnerId = undefined
-      runObjects = []
+    } finally {
+      this.flushRemovals()
     }
-
-    for (const change of changes) {
-      if (isBlockTableRecordRemove(change)) {
-        if (runOwnerId !== change.container.ownerId) {
-          flush()
-          runOwnerId = change.container.ownerId
-        }
-        runObjects.push(change.object)
-        continue
-      }
-      flush()
-      this.applyChange(change, true)
-    }
-    flush()
   }
 
   /**
    * Replays the inverse of each change in reverse order.
    *
    * Used by undo and transaction abort to restore the prior database state.
+   * Undoing an append deletes the appended object, so consecutive ones collapse
+   * into one `removeEntity(ids)` call exactly like forward removals do.
    *
    * @param changes - Ordered list of changes recorded by {@link AcDbChangeRecorder}
    */
   applyInverse(changes: AcDbDatabaseChange[]): void {
-    for (let i = changes.length - 1; i >= 0; i--) {
-      this.applyChange(changes[i], false)
+    try {
+      for (let i = changes.length - 1; i >= 0; i--) {
+        this.applyChange(changes[i], false)
+      }
+    } finally {
+      this.flushRemovals()
     }
   }
 
@@ -114,6 +116,13 @@ export class AcDbChangeApplier {
    * @param forward - When true, replay the original mutation; when false, apply its inverse
    */
   private applyChange(change: AcDbDatabaseChange, forward: boolean): void {
+    if (isBlockTableRecordDeletion(change, forward)) {
+      this.queueRemoval(change.container.ownerId, change.object)
+      return
+    }
+    // Everything else may depend on the queued deletions having happened.
+    this.flushRemovals()
+
     switch (change.kind) {
       case 'modify':
         this.applyModify(change, forward)
@@ -139,7 +148,25 @@ export class AcDbChangeApplier {
   }
 
   /**
-   * Removes a run of objects from one block table record in a single call.
+   * Queues one object for deletion from a block table record.
+   *
+   * Runs for the same owner accumulate in {@link pendingRemovals} and are
+   * deleted together by {@link flushRemovals}.
+   *
+   * @param ownerId - Object id of the block table record holding the object
+   * @param object - Object that the replayed change deletes
+   */
+  private queueRemoval(ownerId: string, object: AcDbObject): void {
+    if (this.pendingRemoveOwnerId !== ownerId) {
+      this.flushRemovals()
+      this.pendingRemoveOwnerId = ownerId
+    }
+    this.pendingRemovals.push(object)
+  }
+
+  /**
+   * Removes the queued run of objects from one block table record in a single
+   * call.
    *
    * The result is defined by the surviving sequence only: stable compaction
    * yields the same entity order whether the ids are removed one at a time or
@@ -158,20 +185,24 @@ export class AcDbChangeApplier {
    * notifies `entityErased` once per removal, and inside an open transaction it
    * records the removals in change-list order. Fusing either of those into one
    * bulk call is observable, and no production path asks for it.
-   *
-   * @param ownerId - Object id of the block table record holding the objects
-   * @param objects - Removed entities in recorded order; must not be empty
    */
-  private applyRemoveBatch(ownerId: string, objects: AcDbObject[]): void {
-    if (!this.database.transactionManager.isApplyingUndoRedo()) {
-      for (const object of objects) {
-        this.applyRemove({ type: 'blockTableRecord', ownerId }, object)
-      }
+  private flushRemovals(): void {
+    const ownerId = this.pendingRemoveOwnerId
+    const objects = this.pendingRemovals
+    this.pendingRemoveOwnerId = undefined
+    this.pendingRemovals = []
+
+    if (ownerId === undefined || objects.length === 0) {
       return
     }
 
-    if (objects.length === 1) {
-      this.applyRemove({ type: 'blockTableRecord', ownerId }, objects[0])
+    if (
+      objects.length === 1 ||
+      !this.database.transactionManager.isApplyingUndoRedo()
+    ) {
+      for (const object of objects) {
+        this.applyRemove({ type: 'blockTableRecord', ownerId }, object)
+      }
       return
     }
 

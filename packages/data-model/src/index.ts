@@ -1,7 +1,10 @@
 export {
+  AcDbCloneDependencies,
+  AcDbDeepCloneType,
   AcDbDxfCode,
   AcDbDxfFiler,
   AcDbDxfFilerStatus,
+  AcDbIdMapping,
   AcDbHostApplicationServices,
   AcDbObject,
   AcDbOpenMode,
@@ -27,6 +30,8 @@ export {
   acdbChunkUtf8ByMaxBytes
 } from './base/index.js'
 export type {
+  AcDbCloneRecordKind,
+  AcDbIdPair,
   AcDbDxfFilerMode,
   AcDbDxfFilerOptions,
   AcDbDxfHeaderInfo,
@@ -192,7 +197,9 @@ export {
   AcDbCurve,
   AcDbDiametricDimension,
   AcDbDimension,
+  acdbAllocateDimBlockName,
   acdbDimFeatureScale,
+  acdbDisposeDimBlock,
   AcDbEllipse,
   AcDbEntity,
   AcDbFace,
@@ -211,6 +218,7 @@ export {
   AcDbMLeaderContentType,
   AcDbMLeaderDirectionType,
   AcDbMLeaderLineType,
+  AcDbMLeaderPropertyOverrideFlag,
   AcDbMLeaderTextAttachmentDirection,
   AcDbMLine,
   AcDbMLineFlags,

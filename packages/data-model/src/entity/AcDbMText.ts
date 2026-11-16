@@ -18,6 +18,10 @@ import {
 } from '@mlightcad/graphic-interface'
 
 import { AcDbDxfFiler } from '../base/AcDbDxfFiler.js'
+import type {
+  AcDbCloneDependencies,
+  AcDbIdMapping
+} from '../base/AcDbIdMapping.js'
 import {
   type AcDbAnnotationScaleContext,
   type AcDbAnnotationScaleDrawInfo,
@@ -40,6 +44,7 @@ import {
   acdbMTextBackgroundMaskPadding,
   acdbResolveMTextLayoutMetrics
 } from './AcDbTextExtentsHelpers.js'
+import { acdbTransformNormal } from './AcDbTransformHelpers.js'
 
 /**
  * Represents a multiline text (mtext) entity in AutoCAD.
@@ -688,10 +693,14 @@ export class AcDbMText extends AcDbEntity {
       if (this._extentsWidth > 0) {
         this._extentsWidth *= xScale
       }
+      this._columnWidth *= xScale
+      this._columnGutter *= xScale
     }
     if (yScale > 0) {
       this._height *= yScale
+      this._annotationHeight *= yScale
     }
+    this._normal.copy(acdbTransformNormal(this._normal, matrix))
     return this
   }
 
@@ -1273,6 +1282,26 @@ export class AcDbMText extends AcDbEntity {
 
   private encodeMTextContentsForDxf(contents: string): string {
     return (contents ?? '').replace(/\r\n|\r|\n/g, '\\P')
+  }
+
+  /**
+   * Adds the text style this entity references.
+   *
+   * @param deps - Dependency collector.
+   */
+  override collectCloneDependencies(deps: AcDbCloneDependencies): void {
+    super.collectCloneDependencies(deps)
+    deps.addName('textStyle', this._styleName)
+  }
+
+  /**
+   * Translates the text style name of a cloned entity.
+   *
+   * @param idMap - Id mapping of the current clone operation.
+   */
+  override translateClonedReferences(idMap: AcDbIdMapping): void {
+    super.translateClonedReferences(idMap)
+    this._styleName = idMap.translateName('textStyle', this._styleName)
   }
 
   /**

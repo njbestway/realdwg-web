@@ -1,14 +1,18 @@
 import {
   AcGeMatrix3d,
   AcGePoint3d,
-  AcGePoint3dLike
+  AcGePoint3dLike,
+  AcGeVector3d,
+  AcGeVector3dLike
 } from '@mlightcad/geometry-engine'
 
 import { AcDbDxfFiler } from '../../base/index.js'
 import { AcDbEntityProperties } from '../AcDbEntityProperties.js'
+import { acdbUniformScaleFactor } from '../AcDbTransformHelpers.js'
 import {
   acdbAngleOfPoints,
   acdbAppendCenterMark,
+  acdbAppendRadialTextLanding,
   acdbArrowScaleFromStyle,
   acdbBuildAnnotationText,
   acdbCreateDimArrowInsert,
@@ -17,9 +21,12 @@ import {
   acdbCreateEmptyDimBlock,
   acdbDimFeatureScale,
   acdbEnsureDimArrowBlocks,
+  acdbLeaderLengthToText,
   acdbOffsetTextAlongNormal,
   acdbPointAt,
-  acdbResolveArrowBlockName
+  acdbReadableTextAngle,
+  acdbResolveArrowBlockName,
+  acdbRotatePointAroundCenter
 } from './AcDbDimBlockBuilder.js'
 import { AcDbDimension } from './AcDbDimension.js'
 
@@ -334,10 +341,72 @@ export class AcDbRadialDimension extends AcDbDimension {
   protected override subTransformBy(matrix: AcGeMatrix3d) {
     this._center.applyMatrix4(matrix)
     this._chordPoint.applyMatrix4(matrix)
+    this._leaderLength *= acdbUniformScaleFactor(matrix)
   }
 
-  protected override getMeasurementPropertyValue() {
-    return this.measurement ?? this.center.distanceTo(this.chordPoint)
+  /** @inheritdoc */
+  protected override computeMeasurement() {
+    return this.center.distanceTo(this.chordPoint)
+  }
+
+  /**
+   * Stretching center and chord together translates the radius dimension. A
+   * single chord grip slides around the circle; the center grip alone moves
+   * the center (changing the measured radius).
+   *
+   * @inheritdoc
+   */
+  override subMoveGripPointsAt(indices: number[], offset: AcGeVector3dLike) {
+    const moveBoth = indices.includes(0) && indices.includes(1)
+    if (!moveBoth) {
+      return super.subMoveGripPointsAt(indices, offset)
+    }
+    this._center.add(offset)
+    this._chordPoint.add(offset)
+    if (indices.includes(2)) {
+      // Whole-dimension stretch: keep text relative without swinging.
+      this.textPosition.add(offset)
+    }
+    return this
+  }
+
+  /**
+   * @inheritdoc
+   */
+  protected override moveDefinitionGripAt(
+    index: number,
+    offset: AcGeVector3dLike
+  ) {
+    if (index === 1) {
+      acdbRotatePointAroundCenter(
+        this._center,
+        this._chordPoint,
+        this._chordPoint.clone().add(offset)
+      )
+      return
+    }
+    super.moveDefinitionGripAt(index, offset)
+  }
+
+  /**
+   * Like AutoCAD, dragging the text swings the dimension around the circle so
+   * it points at the text; text outside the circle gets a leader whose length
+   * follows the drag distance.
+   *
+   * @inheritdoc
+   */
+  protected override moveTextGrip(offset: AcGeVector3dLike) {
+    const target = this.textPosition.clone().add(offset)
+    const radius = this._center.distanceTo(this._chordPoint)
+    acdbRotatePointAroundCenter(this._center, this._chordPoint, target)
+    this.leaderLength = acdbLeaderLengthToText(
+      this._center.distanceTo(target),
+      radius,
+      this.dimensionStyle,
+      this
+    )
+    this.textPosition = target
+    this.isUsingDefaultTextPosition = true
   }
 
   createDimBlock(blockName: string) {
@@ -349,32 +418,30 @@ export class AcDbRadialDimension extends AcDbDimension {
     const angle = acdbAngleOfPoints(this.center, this.chordPoint)
     const leaderLen = this.leaderLength
 
+    if (!this.isUsingDefaultTextPosition) {
+      this.appendUserTextGeometry(block, radius, angle)
+      acdbAppendCenterMark(block, this.center, style, this)
+      return block
+    }
+
     // Dimension line from center through chord, optionally extended by leader
     const outer =
       leaderLen > 0
         ? acdbPointAt(this.chordPoint, angle, leaderLen)
         : this.chordPoint.clone()
 
-    block.appendEntity(
-      acdbCreateDimLineEntity(this.center, outer, style)
-    )
+    block.appendEntity(acdbCreateDimLineEntity(this.center, outer, style))
 
     if (leaderLen > 0) {
       // Horizontal dogleg toward text
-      const doglegLen =
-        style.dimasz * acdbDimFeatureScale(style, this) * 2
+      const doglegLen = style.dimasz * acdbDimFeatureScale(style, this) * 2
       const doglegEnd = new AcGePoint3d(
         outer.x + (Math.cos(angle) >= 0 ? doglegLen : -doglegLen),
         outer.y,
         outer.z
       )
       block.appendEntity(acdbCreateDimLineEntity(outer, doglegEnd, style))
-      const textPos = acdbOffsetTextAlongNormal(
-        doglegEnd,
-        0,
-        style,
-        this
-      )
+      const textPos = acdbOffsetTextAlongNormal(doglegEnd, 0, style, this)
       this.textPosition = textPos
       const contents = acdbBuildAnnotationText(
         this.measurement ?? radius,
@@ -428,6 +495,68 @@ export class AcDbRadialDimension extends AcDbDimension {
 
     acdbAppendCenterMark(block, this.center, style, this)
     return block
+  }
+
+  /**
+   * Builds the graphics for text kept at a user position (DWG/DXF text not
+   * at its home location), like AutoCAD: horizontal text (DIMTIH inside the
+   * circle, DIMTOH outside) gets a dimension line from the arrowhead to the
+   * text height and a short horizontal landing; aligned text keeps the line
+   * from the center to the chord point.
+   */
+  private appendUserTextGeometry(
+    block: ReturnType<typeof acdbCreateEmptyDimBlock>,
+    radius: number,
+    angle: number
+  ) {
+    const style = this.dimensionStyle
+    const text = this.textPosition.clone()
+    const inside = this.center.distanceTo(text) <= radius
+    const horizontal = (inside ? style.dimtih : style.dimtoh) === 1
+
+    if (horizontal) {
+      // Inside text: the line runs in toward the text; outside text: out.
+      const direction = inside
+        ? new AcGeVector3d().subVectors(this.center, this.chordPoint)
+        : new AcGeVector3d().subVectors(this.chordPoint, this.center)
+      acdbAppendRadialTextLanding(
+        block,
+        this.chordPoint,
+        direction,
+        text,
+        style,
+        this
+      )
+    } else {
+      block.appendEntity(
+        acdbCreateDimLineEntity(this.center, this.chordPoint, style)
+      )
+    }
+
+    const arrow = acdbCreateDimArrowInsert(
+      this.chordPoint,
+      inside ? angle : angle + Math.PI,
+      acdbArrowScaleFromStyle(style, this),
+      acdbResolveArrowBlockName(
+        style.dimsah === 0 ? style.dimblk : style.dimblk2
+      )
+    )
+    if (arrow) block.appendEntity(arrow)
+
+    const contents = acdbBuildAnnotationText(
+      this.measurement ?? radius,
+      this.dimensionText,
+      style,
+      'radial'
+    )
+    const mtext = acdbCreateDimMText({
+      contents,
+      position: text,
+      rotation: horizontal ? 0 : acdbReadableTextAngle(angle),
+      style,
+      entity: this
+    })
+    if (mtext) block.appendEntity(mtext)
   }
 
   /**

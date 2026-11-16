@@ -1,13 +1,17 @@
 import {
   AcGeMatrix3d,
   AcGePoint3d,
-  AcGePoint3dLike
+  AcGePoint3dLike,
+  AcGeVector3d,
+  AcGeVector3dLike
 } from '@mlightcad/geometry-engine'
 
 import { AcDbDxfFiler } from '../../base/index.js'
 import { AcDbEntityProperties } from '../AcDbEntityProperties.js'
+import { acdbUniformScaleFactor } from '../AcDbTransformHelpers.js'
 import {
   acdbAngleOfPoints,
+  acdbAppendRadialTextLanding,
   acdbArrowScaleFromStyle,
   acdbBuildAnnotationText,
   acdbCreateDimArrowInsert,
@@ -16,10 +20,13 @@ import {
   acdbCreateEmptyDimBlock,
   acdbDimFeatureScale,
   acdbEnsureDimArrowBlocks,
+  acdbLeaderLengthToText,
   acdbMidPoint,
   acdbOffsetTextAlongNormal,
   acdbPointAt,
-  acdbResolveArrowBlockName
+  acdbReadableTextAngle,
+  acdbResolveArrowBlockName,
+  acdbRotatePointAroundCenter
 } from './AcDbDimBlockBuilder.js'
 import { AcDbDimension } from './AcDbDimension.js'
 
@@ -225,10 +232,71 @@ export class AcDbDiametricDimension extends AcDbDimension {
   protected override subTransformBy(matrix: AcGeMatrix3d) {
     this._chordPoint.applyMatrix4(matrix)
     this._farChordPoint.applyMatrix4(matrix)
+    this._leaderLength *= acdbUniformScaleFactor(matrix)
   }
 
-  protected override getMeasurementPropertyValue() {
-    return this.measurement ?? this.chordPoint.distanceTo(this.farChordPoint)
+  /** @inheritdoc */
+  protected override computeMeasurement() {
+    return this.chordPoint.distanceTo(this.farChordPoint)
+  }
+
+  /**
+   * Stretching both chord grips together translates the diameter. A single
+   * chord grip swings around the circle center; the opposite point follows
+   * so the measured diameter is kept.
+   *
+   * @inheritdoc
+   */
+  override subMoveGripPointsAt(indices: number[], offset: AcGeVector3dLike) {
+    const moveBothChords = indices.includes(0) && indices.includes(1)
+    if (!moveBothChords) {
+      return super.subMoveGripPointsAt(indices, offset)
+    }
+    this._chordPoint.add(offset)
+    this._farChordPoint.add(offset)
+    if (indices.includes(2)) {
+      // Whole-dimension stretch: keep text relative without swinging.
+      this.textPosition.add(offset)
+    }
+    return this
+  }
+
+  /**
+   * @inheritdoc
+   */
+  protected override moveDefinitionGripAt(
+    index: number,
+    offset: AcGeVector3dLike
+  ) {
+    if (index !== 0 && index !== 1) return
+    const moved = index === 0 ? this._chordPoint : this._farChordPoint
+    const other = index === 0 ? this._farChordPoint : this._chordPoint
+    const center = acdbMidPoint(this._chordPoint, this._farChordPoint)
+    acdbRotatePointAroundCenter(center, moved, moved.clone().add(offset))
+    other.copy(center).multiplyScalar(2).sub(moved)
+  }
+
+  /**
+   * Like AutoCAD, dragging the text swings the diameter so it points at the
+   * text; text outside the circle gets a leader whose length follows the drag
+   * distance.
+   *
+   * @inheritdoc
+   */
+  protected override moveTextGrip(offset: AcGeVector3dLike) {
+    const target = this.textPosition.clone().add(offset)
+    const center = acdbMidPoint(this._chordPoint, this._farChordPoint)
+    const radius = center.distanceTo(this._chordPoint)
+    acdbRotatePointAroundCenter(center, this._chordPoint, target)
+    this._farChordPoint.copy(center).multiplyScalar(2).sub(this._chordPoint)
+    this.leaderLength = acdbLeaderLengthToText(
+      center.distanceTo(target),
+      radius,
+      this.dimensionStyle,
+      this
+    )
+    this.textPosition = target
+    this.isUsingDefaultTextPosition = true
   }
 
   createDimBlock(blockName: string) {
@@ -239,6 +307,25 @@ export class AcDbDiametricDimension extends AcDbDimension {
     const diameter = this.chordPoint.distanceTo(this.farChordPoint)
     const angle = acdbAngleOfPoints(this.farChordPoint, this.chordPoint)
     const leaderLen = this.leaderLength
+    const contents = acdbBuildAnnotationText(
+      this.measurement ?? diameter,
+      this.dimensionText,
+      style,
+      'diametric'
+    )
+
+    const scale = acdbArrowScaleFromStyle(style, this)
+    const arrow1 = acdbResolveArrowBlockName(
+      style.dimsah === 0 ? style.dimblk : style.dimblk1
+    )
+    const arrow2 = acdbResolveArrowBlockName(
+      style.dimsah === 0 ? style.dimblk : style.dimblk2
+    )
+
+    if (!this.isUsingDefaultTextPosition) {
+      this.appendUserTextGeometry(block, contents, angle, arrow1, arrow2)
+      return block
+    }
 
     const outer =
       leaderLen > 0
@@ -249,13 +336,6 @@ export class AcDbDiametricDimension extends AcDbDimension {
       acdbCreateDimLineEntity(this.farChordPoint, outer, style)
     )
 
-    const scale = acdbArrowScaleFromStyle(style, this)
-    const arrow1 = acdbResolveArrowBlockName(
-      style.dimsah === 0 ? style.dimblk : style.dimblk1
-    )
-    const arrow2 = acdbResolveArrowBlockName(
-      style.dimsah === 0 ? style.dimblk : style.dimblk2
-    )
     const a1 = acdbCreateDimArrowInsert(
       this.farChordPoint,
       angle + Math.PI,
@@ -269,8 +349,7 @@ export class AcDbDiametricDimension extends AcDbDimension {
     let textAnchor = acdbMidPoint(this.chordPoint, this.farChordPoint)
     let textRotation = angle
     if (leaderLen > 0) {
-      const doglegLen =
-        style.dimasz * acdbDimFeatureScale(style, this) * 2
+      const doglegLen = style.dimasz * acdbDimFeatureScale(style, this) * 2
       const doglegEnd = new AcGePoint3d(
         outer.x + (Math.cos(angle) >= 0 ? doglegLen : -doglegLen),
         outer.y,
@@ -288,12 +367,6 @@ export class AcDbDiametricDimension extends AcDbDimension {
       this
     )
     this.textPosition = textPos
-    const contents = acdbBuildAnnotationText(
-      this.measurement ?? diameter,
-      this.dimensionText,
-      style,
-      'diametric'
-    )
     const mtext = acdbCreateDimMText({
       contents,
       position: textPos,
@@ -304,6 +377,73 @@ export class AcDbDiametricDimension extends AcDbDimension {
     if (mtext) block.appendEntity(mtext)
 
     return block
+  }
+
+  /**
+   * Builds the graphics for text kept at a user position (DWG/DXF text not
+   * at its home location), like AutoCAD: horizontal text (DIMTIH inside the
+   * circle, DIMTOH outside) gets one arrowhead on the chord point nearer the
+   * text and a dimension line that runs to the text height before a short
+   * horizontal landing; aligned text keeps the full diameter line.
+   */
+  private appendUserTextGeometry(
+    block: ReturnType<typeof acdbCreateEmptyDimBlock>,
+    contents: string,
+    angle: number,
+    arrow1: string,
+    arrow2: string
+  ) {
+    const style = this.dimensionStyle
+    const scale = acdbArrowScaleFromStyle(style, this)
+    const text = this.textPosition.clone()
+    const center = acdbMidPoint(this.chordPoint, this.farChordPoint)
+    const radius = center.distanceTo(this.chordPoint)
+    const inside = center.distanceTo(text) <= radius
+    const horizontal = (inside ? style.dimtih : style.dimtoh) === 1
+    let textRotation = acdbReadableTextAngle(angle)
+
+    if (horizontal) {
+      const nearChord =
+        text.distanceTo(this.chordPoint) <= text.distanceTo(this.farChordPoint)
+      const end = nearChord ? this.chordPoint : this.farChordPoint
+      const outward = acdbAngleOfPoints(center, end)
+      // Inside text: the arrowhead points out at the curve and the line runs
+      // in toward the text; outside text: it points in and the line runs out.
+      const arrow = acdbCreateDimArrowInsert(
+        end,
+        inside ? outward : outward + Math.PI,
+        scale,
+        nearChord ? arrow2 : arrow1
+      )
+      if (arrow) block.appendEntity(arrow)
+      const direction = inside
+        ? new AcGeVector3d().subVectors(center, end)
+        : new AcGeVector3d().subVectors(end, center)
+      acdbAppendRadialTextLanding(block, end, direction, text, style, this)
+      textRotation = 0
+    } else {
+      block.appendEntity(
+        acdbCreateDimLineEntity(this.farChordPoint, this.chordPoint, style)
+      )
+      const a1 = acdbCreateDimArrowInsert(
+        this.farChordPoint,
+        angle + Math.PI,
+        scale,
+        arrow1
+      )
+      const a2 = acdbCreateDimArrowInsert(this.chordPoint, angle, scale, arrow2)
+      if (a1) block.appendEntity(a1)
+      if (a2) block.appendEntity(a2)
+    }
+
+    const mtext = acdbCreateDimMText({
+      contents,
+      position: text,
+      rotation: textRotation,
+      style,
+      entity: this
+    })
+    if (mtext) block.appendEntity(mtext)
   }
 
   /**

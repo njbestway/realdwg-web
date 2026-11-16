@@ -3,7 +3,8 @@ import {
   AcGeLine3d,
   AcGePoint3d,
   AcGePoint3dLike,
-  AcGeVector3d
+  AcGeVector3d,
+  AcGeVector3dLike
 } from '@mlightcad/geometry-engine'
 import {
   AcGiArrowType,
@@ -34,7 +35,11 @@ export const CLOSED_FILLED_ARROW_BLOCK = '_CLOSEDFILLED'
 export function acdbResolveArrowBlockName(
   dimblk: string | undefined | null
 ): string {
-  if (dimblk == null || dimblk === '' || dimblk === AcGiArrowType.ClosedFilled) {
+  if (
+    dimblk == null ||
+    dimblk === '' ||
+    dimblk === AcGiArrowType.ClosedFilled
+  ) {
     return CLOSED_FILLED_ARROW_BLOCK
   }
   if (dimblk === AcGiArrowType.None || dimblk.toUpperCase() === '_NONE') {
@@ -355,4 +360,202 @@ export function acdbExtendLineByDimDle(
     line.extend(dle)
     line.extend(dle, true)
   }
+}
+
+/**
+ * Allocates the next free anonymous dimension block name (`*D{n}`).
+ *
+ * @param db - Database whose block table is scanned.
+ * @returns A `*D{n}` name one greater than the largest existing one.
+ */
+export function acdbAllocateDimBlockName(db: AcDbDatabase): string {
+  let maxNum = 0
+  for (const block of db.tables.blockTable.newIterator()) {
+    const name = block.name
+    if (!name.startsWith('*D')) continue
+    const num = Number(name.slice(2))
+    if (Number.isInteger(num) && num > maxNum) maxNum = num
+  }
+  return `*D${maxNum + 1}`
+}
+
+/**
+ * Removes an anonymous dimension block and erases its entities.
+ *
+ * `blockTable.remove` alone leaves the child entities registered in the
+ * database, so they are removed from the block record first.
+ *
+ * @param db - Database owning the block.
+ * @param blockName - Name of the block to drop. Missing blocks are ignored.
+ */
+export function acdbDisposeDimBlock(db: AcDbDatabase, blockName: string) {
+  const btr = db.tables.blockTable.getAt(blockName)
+  if (!btr) return
+  const ids: string[] = []
+  for (const entity of btr.newIterator()) {
+    ids.push(entity.objectId)
+  }
+  if (ids.length > 0) btr.removeEntity(ids)
+  db.tables.blockTable.remove(blockName)
+}
+
+/**
+ * Normalizes a text angle into (-π/2, π/2] so dimension text never reads
+ * upside down, matching AutoCAD's aligned dimension text.
+ */
+export function acdbReadableTextAngle(angle: number): number {
+  let v = Math.atan2(Math.sin(angle), Math.cos(angle))
+  if (v > Math.PI / 2 + 1e-9) v -= Math.PI
+  else if (v <= -Math.PI / 2 + 1e-9) v += Math.PI
+  return v
+}
+
+/**
+ * Returns the point where a leader from `from` should stop before reaching
+ * dimension text centered at `text`, leaving the DIMGAP clearance.
+ */
+export function acdbLeaderEndBeforeText(
+  from: AcGePoint3dLike,
+  text: AcGePoint3dLike,
+  style: AcDbDimStyleTableRecord,
+  entity?: AcDbObject
+): AcGePoint3d {
+  const clearance =
+    (style.dimgap >= 0 ? style.dimgap : 0) *
+      acdbDimFeatureScale(style, entity) +
+    acdbTextHeightFromStyle(style, entity) * 0.5
+  const end = new AcGePoint3d().copy(text)
+  const dir = new AcGeVector3d().subVectors(end, from)
+  const length = dir.length()
+  if (length <= clearance) return end
+  return end.sub(dir.multiplyScalar(clearance / length))
+}
+
+/**
+ * Re-places the dimension arc point of an angular or arc length dimension
+ * so the dimension arc runs under text dragged to `text` (DIMTMOVE 0).
+ *
+ * @param center - Center of the dimension arc.
+ * @param arcPoint - Arc point updated in place.
+ * @param text - New text position.
+ * @param textRadialOffset - Distance from the arc to the text center.
+ */
+export function acdbMoveArcPointUnderText(
+  center: AcGePoint3dLike,
+  arcPoint: AcGePoint3d,
+  text: AcGePoint3dLike,
+  textRadialOffset: number
+) {
+  const direction = new AcGeVector3d().subVectors(text, center)
+  const distance = direction.length()
+  if (distance < 1e-9) return
+  const radius = Math.max(distance - textRadialOffset, distance * 0.1)
+  arcPoint.copy(center).add(direction.multiplyScalar(radius / distance))
+}
+
+/**
+ * Appends a leader line from `from` to text placed at a user-defined
+ * position (DIMTMOVE 1), when the text is farther than one arrow size away.
+ */
+export function acdbAppendLeaderToText(
+  block: AcDbBlockTableRecord,
+  from: AcGePoint3dLike,
+  text: AcGePoint3dLike,
+  style: AcDbDimStyleTableRecord,
+  entity?: AcDbObject
+) {
+  const start = new AcGePoint3d().copy(from)
+  if (start.distanceTo(text) <= acdbArrowScaleFromStyle(style, entity)) return
+  block.appendEntity(
+    acdbCreateDimLineEntity(
+      start,
+      acdbLeaderEndBeforeText(start, text, style, entity),
+      style
+    )
+  )
+}
+
+/**
+ * Appends the dimension line AutoCAD draws for radius and diameter text kept
+ * at a user position as horizontal text (DIMTIH / DIMTOH): from the arrowhead
+ * along the dimension line to the knee level with the text, then a
+ * horizontal landing one arrow size long toward the text.
+ *
+ * @param block - Dimension block receiving the lines.
+ * @param arrowPoint - Arrowhead tip on the measured curve.
+ * @param direction - Direction of the dimension line through `arrowPoint`.
+ * @param text - User text position.
+ * @param style - Effective dimension style.
+ * @param entity - Dimension owning the block (annotation scale lookup).
+ */
+export function acdbAppendRadialTextLanding(
+  block: AcDbBlockTableRecord,
+  arrowPoint: AcGePoint3dLike,
+  direction: AcGeVector3dLike,
+  text: AcGePoint3dLike,
+  style: AcDbDimStyleTableRecord,
+  entity?: AcDbObject
+) {
+  const start = new AcGePoint3d().copy(arrowPoint)
+  const dir = new AcGeVector3d(direction.x, direction.y, 0)
+  if (dir.lengthSq() < 1e-18) return
+  dir.normalize()
+  const offset = new AcGeVector3d(text.x - start.x, text.y - start.y, 0)
+  // Horizontal text: knee is where the dimension line meets the text height.
+  // Near-horizontal lines never reach a different Y, and a tiny dir.y makes
+  // offset.y / dir.y explode, so fall back to the orthogonal projection.
+  const projected = offset.dot(dir)
+  let along = projected
+  if (Math.abs(dir.y) > 1e-3) {
+    const alongY = offset.y / dir.y
+    if (Number.isFinite(alongY) && Math.abs(alongY - projected) < 1e6) {
+      along = alongY
+    }
+  }
+  const knee = start.clone().add(dir.multiplyScalar(along))
+  if (start.distanceTo(knee) > 1e-9) {
+    block.appendEntity(acdbCreateDimLineEntity(start, knee, style))
+  }
+  const landing = style.dimasz * acdbDimFeatureScale(style, entity)
+  const end = new AcGePoint3d(
+    knee.x + (text.x >= knee.x ? landing : -landing),
+    knee.y,
+    knee.z
+  )
+  block.appendEntity(acdbCreateDimLineEntity(knee, end, style))
+}
+
+/**
+ * Swings `point` around `center` toward `toward`, keeping its distance from
+ * the center (radius and diameter chord grips stay on the circle).
+ *
+ * @param center - Circle center.
+ * @param point - Point on the circle, updated in place.
+ * @param toward - Location that sets the new direction from the center.
+ */
+export function acdbRotatePointAroundCenter(
+  center: AcGePoint3dLike,
+  point: AcGePoint3d,
+  toward: AcGePoint3dLike
+) {
+  const radius = point.distanceTo(center)
+  const direction = new AcGeVector3d().subVectors(toward, center)
+  if (radius < 1e-9 || direction.lengthSq() < 1e-18) return
+  point.copy(center).add(direction.normalize().multiplyScalar(radius))
+}
+
+/**
+ * Leader length for radius/diameter text dragged `distance` from the center
+ * of a circle of `radius`: zero inside the circle, otherwise the part of the
+ * drag beyond the circle minus the horizontal landing drawn before the text.
+ */
+export function acdbLeaderLengthToText(
+  distance: number,
+  radius: number,
+  style: AcDbDimStyleTableRecord,
+  entity?: AcDbObject
+): number {
+  if (distance <= radius) return 0
+  const landing = style.dimasz * acdbDimFeatureScale(style, entity) * 2
+  return Math.max(distance - radius - landing, 1e-6)
 }

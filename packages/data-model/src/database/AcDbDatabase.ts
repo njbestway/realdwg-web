@@ -15,6 +15,9 @@ import {
   acdbAssignWorkingDatabase
 } from '../base/AcDbObject.js'
 import { AcDbOpenMode } from '../base/AcDbOpenMode.js'
+import { AcDbDuplicateRecordCloning } from '../base/AcDbDuplicateRecordCloning.js'
+import { AcDbDeepCloneType, AcDbIdMapping } from '../base/AcDbIdMapping.js'
+import { AcDbDatabaseCloner } from './AcDbDatabaseCloner.js'
 import type { AcDbTypedValue } from '../base/AcDbTypedValue.js'
 import { AcDbRegenerator } from '../converter/AcDbRegenerator.js'
 import {
@@ -78,7 +81,10 @@ import {
 import { acdbBytesToHexString } from '../misc/proxyGraphic/index.js'
 import { AcDbBlockTable } from './AcDbBlockTable.js'
 import { AcDbBlockTableRecord } from './AcDbBlockTableRecord.js'
-import { AcDbConversionStage, AcDbStageStatus } from './AcDbDatabaseConverter.js'
+import {
+  AcDbConversionStage,
+  AcDbStageStatus
+} from './AcDbDatabaseConverter.js'
 import type { AcDbConversionProgressCallback } from './AcDbDatabaseConverter.js'
 import { AcDbOpenDatabaseError } from './AcDbOpenDatabaseError.js'
 import { AcDbDimStyleTable } from './AcDbDimStyleTable.js'
@@ -99,6 +105,7 @@ import { AcDbViewportTableRecord } from './AcDbViewportTableRecord.js'
 import {
   AcGeBox3d,
   AcGeCircArc2d,
+  AcGeMatrix3d,
   AcGePoint3d,
   AcGePoint3dLike
 } from '@mlightcad/geometry-engine'
@@ -373,6 +380,22 @@ export interface AcDbCreateDefaultDataOptions {
   textStyle?: boolean
   dimStyle?: boolean
   layout?: boolean
+}
+
+/**
+ * Appends one entity or a batch to `target`. Not `push(...items)`: a batch
+ * can hold hundreds of thousands of entities (undoing a large import), which
+ * exceeds the engine's argument limit and throws "Maximum call stack size
+ * exceeded".
+ */
+function appendAll(target: AcDbEntity[], entity: AcDbEntity | AcDbEntity[]) {
+  if (!Array.isArray(entity)) {
+    target.push(entity)
+    return
+  }
+  for (let i = 0; i < entity.length; i++) {
+    target.push(entity[i])
+  }
 }
 
 /**
@@ -1006,8 +1029,7 @@ export class AcDbDatabase extends AcDbObject {
    */
   notifyEntityAppended(entity: AcDbEntity | AcDbEntity[]): void {
     if (this.isEventBatched()) {
-      const items = Array.isArray(entity) ? entity : [entity]
-      this._pendingEntityAppended.push(...items)
+      appendAll(this._pendingEntityAppended, entity)
       return
     }
     this.events.entityAppended.dispatch({
@@ -1023,8 +1045,7 @@ export class AcDbDatabase extends AcDbObject {
    */
   notifyEntityErased(entity: AcDbEntity | AcDbEntity[]): void {
     if (this.isEventBatched()) {
-      const items = Array.isArray(entity) ? entity : [entity]
-      this._pendingEntityErased.push(...items)
+      appendAll(this._pendingEntityErased, entity)
       return
     }
     this.events.entityErased.dispatch({
@@ -1332,6 +1353,24 @@ export class AcDbDatabase extends AcDbObject {
         for (const entity of object.newIterator()) {
           if (entity.getAttrWithoutException('ownerId') === oldId) {
             entity.ownerId = handle
+          }
+        }
+        // Keep AcDbLayout.blockTableRecordId in sync. Default Model/Layout1
+        // BTRs often receive low generated handles; later ENTITIES with those
+        // same handles displace the BTR and leave layouts pointing at the
+        // usurping entity (setCurrentLayoutBtrId then throws).
+        for (const layout of this._objects.layout.newIterator()) {
+          if (layout.blockTableRecordId === oldId) {
+            layout.blockTableRecordId = handle
+          }
+        }
+      }
+      // When a layout is reminted, keep BTR.layoutId soft-pointers current so
+      // heal / paper-space binding still recognizes the owning layout.
+      if (object instanceof AcDbLayout) {
+        for (const btr of this._tables.blockTable.newIterator()) {
+          if (btr.layoutId === oldId) {
+            btr.layoutId = handle
           }
         }
       }
@@ -2944,6 +2983,197 @@ export class AcDbDatabase extends AcDbObject {
   }
 
   /**
+   * Clones objects within this database.
+   *
+   * Mirrors `AcDbDatabase::deepCloneObjects()` in ObjectARX. Every entity in
+   * `objectIds` is cloned and appended to the block table record `ownerId`.
+   * Records the entities reference by name (layers, linetypes, styles, blocks)
+   * are shared with the originals, except anonymous blocks such as dimension
+   * blocks, which are copied so each clone owns its own definition.
+   *
+   * @param objectIds - Ids of the entities to clone.
+   * @param ownerId - Id of the block table record that receives the clones.
+   * @param idMap - Receives the source-to-clone id pairs.
+   * @param _deferXlation - Accepted for ObjectARX compatibility; translation
+   * always runs before this method returns.
+   * @returns Ids of the clones, in the order of `objectIds`.
+   * @throws Error when `ownerId` is not a block table record of this database.
+   */
+  deepCloneObjects(
+    objectIds: AcDbObjectId[],
+    ownerId: AcDbObjectId,
+    idMap: AcDbIdMapping,
+    _deferXlation = false
+  ): AcDbObjectId[] {
+    idMap.destDb ??= this
+    if (idMap.deepCloneContext === AcDbDeepCloneType.kDcNone) {
+      idMap.deepCloneContext = AcDbDeepCloneType.kDcObjects
+    }
+    return this.cloneObjectsInto(this, objectIds, ownerId, idMap)
+  }
+
+  /**
+   * Clones objects from this database into another database.
+   *
+   * Mirrors `AcDbDatabase::wblockCloneObjects()` in ObjectARX: it is called on
+   * the source database, `idMap.destDb` names the destination and `ownerId` is
+   * a block table record of the destination. Every layer, linetype, text
+   * style, dimension style, block definition (recursively), MLINE/MLEADER
+   * style and image definition the entities need is cloned too. When the
+   * destination already has a record with the same name, `drc` decides what
+   * happens (see {@link AcDbDuplicateRecordCloning}).
+   *
+   * @param objectIds - Ids of the entities to clone.
+   * @param ownerId - Id of the destination block table record.
+   * @param idMap - Id mapping; `idMap.destDb` must be set.
+   * @param drc - Duplicate record handling.
+   * @param _deferXlation - Accepted for ObjectARX compatibility; translation
+   * always runs before this method returns.
+   * @returns Ids of the clones in the destination, in the order of `objectIds`.
+   * @throws Error when `idMap.destDb` is missing or `ownerId` is not a block
+   * table record of the destination.
+   */
+  wblockCloneObjects(
+    objectIds: AcDbObjectId[],
+    ownerId: AcDbObjectId,
+    idMap: AcDbIdMapping,
+    drc: AcDbDuplicateRecordCloning,
+    _deferXlation = false
+  ): AcDbObjectId[] {
+    const dest = idMap.destDb
+    if (!dest) {
+      throw new Error('wblockCloneObjects requires idMap.destDb to be set.')
+    }
+    idMap.duplicateRecordCloning = drc
+    if (idMap.deepCloneContext === AcDbDeepCloneType.kDcNone) {
+      idMap.deepCloneContext = AcDbDeepCloneType.kDcWblkObjects
+    }
+    return this.cloneObjectsInto(dest, objectIds, ownerId, idMap)
+  }
+
+  /**
+   * Writes the given entities, and everything they depend on, into a new
+   * database.
+   *
+   * Mirrors the `AcDbDatabase::wblock(pOutputDb, outObjIds, basePoint)`
+   * overload in ObjectARX, which COPYCLIP uses to fill the clipboard. The new
+   * database gets default data (layer 0, Continuous, Standard styles) and the
+   * entities keep their coordinates. The new database has no INSBASE header
+   * variable, so callers that need a base point keep it themselves.
+   *
+   * @param objectIds - Ids of the entities to write. Defaults to all of model space.
+   * @returns The new database.
+   */
+  wblock(objectIds?: AcDbObjectId[]): AcDbDatabase {
+    const db = new AcDbDatabase()
+    db.createDefaultData()
+    db.insunits = this.insunits
+    db.ltscale = this.ltscale
+    const ids =
+      objectIds ??
+      Array.from(this.tables.blockTable.modelSpace.newIterator()).map(
+        entity => entity.objectId
+      )
+    const idMap = new AcDbIdMapping(db, AcDbDeepCloneType.kDcWblkObjects)
+    this.wblockCloneObjects(
+      ids,
+      db.tables.blockTable.modelSpace.objectId,
+      idMap,
+      AcDbDuplicateRecordCloning.Ignore
+    )
+    return db
+  }
+
+  /**
+   * Inserts the model space of `sourceDb` into this database.
+   *
+   * Mirrors the `AcDbDatabase::insert()` overloads in ObjectARX, which
+   * PASTECLIP and PASTEBLOCK use:
+   * - With a transform, the model space entities of `sourceDb` are cloned into
+   *   this model space and transformed. Returns the ids of the new entities.
+   * - With a block name, a new block definition with that name is created
+   *   from the model space of `sourceDb`. Returns the id of the new block
+   *   table record.
+   *
+   * Records with a name this database already has are not imported: the
+   * existing definition wins (`DRC_Ignore`), as in AutoCAD.
+   *
+   * @param transformOrBlockName - Transform to apply, or the name of the block to create.
+   * @param sourceDb - Database to insert.
+   * @param _preserveSourceDb - Accepted for ObjectARX compatibility; the
+   * source database is never modified.
+   * @throws Error when a block with `blockName` already exists.
+   */
+  insert(
+    transform: AcGeMatrix3d,
+    sourceDb: AcDbDatabase,
+    preserveSourceDb?: boolean
+  ): AcDbObjectId[]
+  insert(
+    blockName: string,
+    sourceDb: AcDbDatabase,
+    preserveSourceDb?: boolean
+  ): AcDbObjectId
+  insert(
+    transformOrBlockName: AcGeMatrix3d | string,
+    sourceDb: AcDbDatabase,
+    _preserveSourceDb = true
+  ): AcDbObjectId[] | AcDbObjectId {
+    const entities = Array.from(
+      sourceDb.tables.blockTable.modelSpace.newIterator()
+    )
+    const idMap = new AcDbIdMapping(
+      this,
+      AcDbDeepCloneType.kDcInsert,
+      AcDbDuplicateRecordCloning.Ignore
+    )
+
+    if (typeof transformOrBlockName === 'string') {
+      const blockTable = this.tables.blockTable
+      if (blockTable.has(transformOrBlockName)) {
+        throw new Error(`Block '${transformOrBlockName}' already exists.`)
+      }
+      const block = new AcDbBlockTableRecord({ name: transformOrBlockName })
+      blockTable.add(block)
+      new AcDbDatabaseCloner(sourceDb, this, idMap).cloneEntities(
+        entities,
+        block
+      )
+      return block.objectId
+    }
+
+    const clones = new AcDbDatabaseCloner(sourceDb, this, idMap).cloneEntities(
+      entities,
+      this.tables.blockTable.modelSpace,
+      transformOrBlockName
+    )
+    return clones.map(clone => clone.objectId)
+  }
+
+  /** Shared implementation of deep and wblock object cloning. */
+  private cloneObjectsInto(
+    dest: AcDbDatabase,
+    objectIds: AcDbObjectId[],
+    ownerId: AcDbObjectId,
+    idMap: AcDbIdMapping
+  ): AcDbObjectId[] {
+    const owner = dest.getObjectById(ownerId)
+    if (!(owner instanceof AcDbBlockTableRecord)) {
+      throw new Error(
+        `Owner '${ownerId}' is not a block table record of the destination database.`
+      )
+    }
+    const entities = objectIds
+      .map(id => this.getObjectById(id))
+      .filter((object): object is AcDbEntity => object instanceof AcDbEntity)
+    const clones = new AcDbDatabaseCloner(this, dest, idMap).cloneEntities(
+      entities,
+      owner
+    )
+    return clones.map(clone => clone.objectId)
+  }
+
+  /**
    * Ensures style dictionaries contain defaults required by one entity type.
    *
    * This is primarily used during entity append so newly created entities can
@@ -2954,20 +3184,52 @@ export class AcDbDatabase extends AcDbObject {
   ensureEntityStyleDefaults(entity: AcDbEntity) {
     if (entity.dxfTypeName === 'MLINE') {
       this.ensureMLineStyle(this._cmlstyle || DEFAULT_MLINE_STYLE)
-      return
-    }
-
-    if (entity.dxfTypeName === 'MULTILEADER') {
+    } else if (entity.dxfTypeName === 'MULTILEADER') {
       this.ensureMLeaderStyle(this._cmleaderstyle || DEFAULT_MLEADER_STYLE)
-      return
-    }
-
-    if (entity.dxfTypeName === 'HATCH') {
+    } else if (entity.dxfTypeName === 'HATCH') {
       const hatch = entity as AcDbEntity & {
         applyPatternDefaultsFromSysVars?: (db: AcDbDatabase) => void
       }
       hatch.applyPatternDefaultsFromSysVars?.(this)
     }
+
+    // Last: reading `entity.layer` materializes CLAYER for entities without an
+    // explicit layer, which must not pre-empt sysvar defaults such as HPLAYER.
+    this.ensureEntityLayer(entity)
+  }
+
+  /**
+   * Creates the layer referenced by one entity when the layer table lacks it.
+   *
+   * AutoCAD creates such layers (color 7, Continuous, on, thawed) when it
+   * loads a drawing whose entities reference undeclared layers, e.g. R12 DXF
+   * files without a TABLES section. Doing it on append, before
+   * `entityAppended` fires, lets viewers create the matching layer group
+   * before they draw the entity (mlightcad/cad-viewer#901).
+   */
+  private ensureEntityLayer(entity: AcDbEntity) {
+    const name = entity.layer
+    if (!name || this.tables.layerTable.has(name)) {
+      return
+    }
+    this.tables.layerTable.add(this.createDefaultLayerRecord(name))
+  }
+
+  /**
+   * Builds a layer record with AutoCAD's defaults for a new layer.
+   */
+  private createDefaultLayerRecord(name: string) {
+    const defaultColor = new AcCmColor()
+    defaultColor.colorIndex = 7
+    return new AcDbLayerTableRecord({
+      name,
+      standardFlags: 0,
+      linetype: DEFAULT_LINE_TYPE,
+      lineWeight: 0,
+      isOff: false,
+      color: defaultColor,
+      isPlottable: true
+    })
   }
 
   /**
@@ -3024,19 +3286,7 @@ export class AcDbDatabase extends AcDbObject {
    */
   private ensureDatabaseDefaults() {
     if (!this.tables.layerTable.has('0')) {
-      const defaultColor = new AcCmColor()
-      defaultColor.colorIndex = 7
-      this.tables.layerTable.add(
-        new AcDbLayerTableRecord({
-          name: '0',
-          standardFlags: 0,
-          linetype: DEFAULT_LINE_TYPE,
-          lineWeight: 0,
-          isOff: false,
-          color: defaultColor,
-          isPlottable: true
-        })
-      )
+      this.tables.layerTable.add(this.createDefaultLayerRecord('0'))
     }
 
     if (!this.tables.linetypeTable.has(ByBlock)) {
@@ -3091,7 +3341,8 @@ export class AcDbDatabase extends AcDbObject {
     this.ensureMLeaderStyle(this._cmleaderstyle || DEFAULT_MLEADER_STYLE)
 
     const modelSpace = this.tables.blockTable.modelSpace
-    if (!this.objects.layout.getAt('Model')) {
+    const modelLayout = this.objects.layout.getAt('Model')
+    if (!modelLayout) {
       const layout = new AcDbLayout()
       layout.layoutName = 'Model'
       layout.tabOrder = 0
@@ -3102,6 +3353,16 @@ export class AcDbDatabase extends AcDbObject {
       layout.extents.max.copy({ x: 1000000, y: 1000000, z: 0 })
       this.objects.layout.setAt(layout.layoutName, layout)
       modelSpace.layoutId = layout.objectId
+    } else {
+      // Converters can leave Model.blockTableRecordId on a stale handle while
+      // *Model_Space (and entity ownerIds) use a different id. Relink so open
+      // framing / layout tabs activate the space that actually has geometry.
+      if (modelLayout.blockTableRecordId !== modelSpace.objectId) {
+        modelLayout.blockTableRecordId = modelSpace.objectId
+      }
+      if (modelSpace.layoutId !== modelLayout.objectId) {
+        modelSpace.layoutId = modelLayout.objectId
+      }
     }
     this.ensureDefaultPaperSpaceLayout()
     if (!this.tables.appIdTable.has(ACAD_APPID)) {
@@ -3241,8 +3502,7 @@ export class AcDbDatabase extends AcDbObject {
       // Pre-R2007: declare a legacy code page. Non-ASCII text is written as
       // `\U+nnnn` escapes (see AcDbDxfFiler) so the ASCII payload matches.
       const name = this._dwgCodePage
-      const legacy =
-        name && !/^utf-?8$/i.test(name) ? name : 'ANSI_1252'
+      const legacy = name && !/^utf-?8$/i.test(name) ? name : 'ANSI_1252'
       filer.writeString(3, legacy)
     }
     filer.writeString(9, '$INSUNITS')

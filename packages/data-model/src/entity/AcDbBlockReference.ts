@@ -12,6 +12,10 @@ import {
 import { AcGiEntity, AcGiRenderer } from '@mlightcad/graphic-interface'
 
 import { AcDbDxfFiler } from '../base/AcDbDxfFiler.js'
+import type {
+  AcDbCloneDependencies,
+  AcDbIdMapping
+} from '../base/AcDbIdMapping.js'
 import { AcDbObjectId } from '../base/AcDbObject.js'
 import {
   type AcDbAnnotationScaleContext,
@@ -41,6 +45,7 @@ import {
   acdbParseGsMark,
   acdbPickNearestOsnapPoint
 } from './AcDbOsnapHelpers.js'
+import { acdbTransformNormal } from './AcDbTransformHelpers.js'
 
 /**
  * Represents a block reference entity in AutoCAD.
@@ -658,21 +663,36 @@ export class AcDbBlockReference extends AcDbEntity {
     const yAxis = new AcGeVector3d(yAxisPoint).sub(origin)
     const zAxis = new AcGeVector3d(zAxisPoint).sub(origin)
 
-    let normal = new AcGeVector3d().crossVectors(xAxis, yAxis)
-    if (normal.lengthSq() === 0) {
-      normal = this._normal.clone().transformDirection(matrix)
-    } else {
-      normal.normalize()
-    }
-
-    const extrusionMatrix = new AcGeMatrix3d().setFromExtrusionDirection(normal)
-    const ocsInverse = extrusionMatrix.clone().invert()
+    // The extrusion follows the plane (inverse transpose), so a mirror inside
+    // the XY plane keeps +Z and shows up as a negative scale factor instead,
+    // the way AutoCAD stores mirrored inserts.
+    const normal = acdbTransformNormal(this._normal, matrix)
+    const ocsInverse = new AcGeMatrix3d()
+      .setFromExtrusionDirection(normal)
+      .invert()
     const localXAxis = xAxis.clone().applyMatrix4(ocsInverse)
+    const localYAxis = yAxis.clone().applyMatrix4(ocsInverse)
+    const localZAxis = zAxis.clone().applyMatrix4(ocsInverse)
+
+    // Keep the sign of the X scale factor so a MOVE / ROTATE / SCALE never
+    // rewrites a mirrored insert as `rotation + PI` with a flipped Y scale.
+    const xSign = this._scaleFactors.x < 0 ? -1 : 1
+    const newRotation = Math.atan2(xSign * localXAxis.y, xSign * localXAxis.x)
+    // Y scale sign: which side of the X axis the transformed Y axis lies on.
+    const yDot =
+      -Math.sin(newRotation) * localYAxis.x +
+      Math.cos(newRotation) * localYAxis.y
+    const ySign = yDot < 0 ? -1 : 1
+    const zSign = localZAxis.z < 0 ? -1 : 1
 
     this._position.copy(origin)
     this._normal.copy(normal)
-    this._rotation = Math.atan2(localXAxis.y, localXAxis.x)
-    this._scaleFactors.set(xAxis.length(), yAxis.length(), zAxis.length())
+    this._rotation = newRotation
+    this._scaleFactors.set(
+      xSign * xAxis.length(),
+      ySign * yAxis.length(),
+      zSign * zAxis.length()
+    )
 
     this._attribs.forEach(attrib => attrib.transformBy(matrix))
     return this
@@ -1365,6 +1385,38 @@ export class AcDbBlockReference extends AcDbEntity {
   private getFullInsertionTransform() {
     const extrusion = new AcGeMatrix3d().setFromExtrusionDirection(this._normal)
     return new AcGeMatrix3d().multiplyMatrices(extrusion, this.blockTransform)
+  }
+
+  /**
+   * Adds the referenced block definition and everything the attached
+   * attributes reference.
+   *
+   * @param deps - Dependency collector.
+   */
+  override collectCloneDependencies(deps: AcDbCloneDependencies): void {
+    super.collectCloneDependencies(deps)
+    deps.addName('block', this._blockName)
+    this._attribs.forEach(attrib => attrib.collectCloneDependencies(deps))
+  }
+
+  /**
+   * Translates the block name of a clone and the references of its
+   * attributes.
+   *
+   * The attributes were already copied by {@link AcDbObject.clone}; they are
+   * re-keyed and get real handles when the clone is appended (see
+   * {@link syncAttributeDatabases}).
+   *
+   * @param idMap - Id mapping of the current clone operation.
+   */
+  override translateClonedReferences(idMap: AcDbIdMapping): void {
+    super.translateClonedReferences(idMap)
+    this._blockName = idMap.translateName('block', this._blockName)
+    this._attribs.forEach(attrib => {
+      attrib.database = this.database
+      attrib.extensionDictionary = undefined
+      attrib.translateClonedReferences(idMap)
+    })
   }
 
   /**

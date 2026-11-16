@@ -1,5 +1,6 @@
 import {
   AcDb3PointAngularDimension,
+  AcDbAlignedDimension,
   AcDbArc,
   AcDbAttribute,
   AcDbBlockReference,
@@ -13,6 +14,7 @@ import {
   AcDbOrdinateDimension,
   AcDbPolyline,
   AcDbProxyEntity,
+  AcDbRotatedDimension,
   AcDbShape,
   AcDbSolid,
   AcDbText,
@@ -386,6 +388,112 @@ describe('libredwg AcDbEntityConverter', () => {
     expect(dim.dimensionType & 0x40).toBe(0x40)
   })
 
+  // libredwg-web reports DIMENSION_LINEAR with the aligned subclass marker and
+  // the block insert rotation instead of the dimension rotation.
+  const linearDimension = (overrides: Record<string, unknown>) => ({
+    type: 'DIMENSION',
+    subclassMarker: 'AcDbAlignedDimension',
+    handle: '1729F',
+    ownerBlockRecordSoftId: '18',
+    layer: '0',
+    name: '*D380',
+    styleName: 'STANDARD',
+    text: '',
+    textPoint: { x: 6177.03, y: 608.04, z: 0 },
+    measurement: 334.07,
+    dimensionType: 32,
+    rotationAngle: 0,
+    obliqueAngle: 0,
+    subDefinitionPoint1: { x: 6135.7, y: 775.07, z: 0 },
+    subDefinitionPoint2: { x: 6135.7, y: 441, z: 0 },
+    definitionPoint: { x: 6184.03, y: 441, z: 0 },
+    ...overrides
+  })
+
+  it('converts linear dimensions reported as aligned into rotated dimensions', () => {
+    acdbHostApplicationServices().workingDatabase = new AcDbDatabase()
+    const converter = new AcDbEntityConverter()
+
+    const vertical = converter.convert(
+      linearDimension({}) as any
+    ) as AcDbRotatedDimension
+    expect(vertical).toBeInstanceOf(AcDbRotatedDimension)
+    expect(Math.abs(Math.sin(vertical.rotation))).toBeCloseTo(1, 9)
+    expect(Math.abs(Math.cos(vertical.rotation))).toBeCloseTo(0, 9)
+    expect(vertical.measurement).toBeCloseTo(334.07, 1)
+
+    // Horizontal 150 dimension whose extension line origins are not level:
+    // as an aligned dimension it would measure the slanted 224.5 chord.
+    const horizontal = converter.convert(
+      linearDimension({
+        handle: '172FD',
+        measurement: 150,
+        dimensionType: 160,
+        subDefinitionPoint1: { x: 5985.7, y: 608.04, z: 0 },
+        subDefinitionPoint2: { x: 6135.7, y: 775.07, z: 0 },
+        definitionPoint: { x: 6135.7, y: 796.16, z: 0 }
+      }) as any
+    ) as AcDbRotatedDimension
+    expect(horizontal).toBeInstanceOf(AcDbRotatedDimension)
+    expect(horizontal.rotation).toBeCloseTo(0, 9)
+    expect(horizontal.measurement).toBeCloseTo(150, 1)
+    expect(horizontal.isUsingDefaultTextPosition).toBe(false)
+  })
+
+  it('keeps aligned dimensions aligned', () => {
+    acdbHostApplicationServices().workingDatabase = new AcDbDatabase()
+    const converter = new AcDbEntityConverter()
+    const aligned = converter.convert(
+      linearDimension({ dimensionType: 33 }) as any
+    )
+    expect(aligned).toBeInstanceOf(AcDbAlignedDimension)
+    expect(aligned).not.toBeInstanceOf(AcDbRotatedDimension)
+  })
+
+  it('classifies linear dimensions without dimensionType when measurement differs from chord', () => {
+    acdbHostApplicationServices().workingDatabase = new AcDbDatabase()
+    const converter = new AcDbEntityConverter()
+    const horizontal = converter.convert(
+      linearDimension({
+        handle: '172FD',
+        measurement: 150,
+        dimensionType: undefined,
+        subDefinitionPoint1: { x: 5985.7, y: 608.04, z: 0 },
+        subDefinitionPoint2: { x: 6135.7, y: 775.07, z: 0 },
+        definitionPoint: { x: 6135.7, y: 796.16, z: 0 }
+      }) as any
+    ) as AcDbRotatedDimension
+    expect(horizontal).toBeInstanceOf(AcDbRotatedDimension)
+    expect(horizontal.measurement).toBeCloseTo(150, 1)
+  })
+
+  it('imports oblique and derives rotation from the extension for oblique linears', () => {
+    acdbHostApplicationServices().workingDatabase = new AcDbDatabase()
+    const converter = new AcDbEntityConverter()
+    // Vertical linear (rotation −π/2): without oblique the extension is +X;
+    // with oblique θ the extension angle is rotation + π/2 + θ.
+    const oblique = Math.PI / 6
+    const extLen = 50
+    const extAngle = -Math.PI / 2 + Math.PI / 2 + oblique
+    const dim = converter.convert(
+      linearDimension({
+        measurement: 334.07,
+        obliqueAngle: oblique,
+        subDefinitionPoint1: { x: 6135.7, y: 775.07, z: 0 },
+        subDefinitionPoint2: { x: 6135.7, y: 441, z: 0 },
+        definitionPoint: {
+          x: 6135.7 + Math.cos(extAngle) * extLen,
+          y: 441 + Math.sin(extAngle) * extLen,
+          z: 0
+        }
+      }) as any
+    ) as AcDbRotatedDimension
+    expect(dim).toBeInstanceOf(AcDbRotatedDimension)
+    expect(dim.oblique).toBeCloseTo(oblique, 9)
+    expect(dim.rotation).toBeCloseTo(-Math.PI / 2, 6)
+    expect(dim.measurement).toBeCloseTo(334.07, 1)
+  })
+
   it('converts LEADER hook-line metadata from libredwg entities', () => {
     acdbHostApplicationServices().workingDatabase = new AcDbDatabase()
     const converter = new AcDbEntityConverter()
@@ -413,6 +521,72 @@ describe('libredwg AcDbEntityConverter', () => {
     expect(leader.textWidth).toBeCloseTo(9.51)
     expect(leader.annoType).toBe(AcDbLeaderAnnotationType.MText)
     expect(leader.horizontalDirection).toMatchObject({ x: 1, y: 0, z: 0 })
+  })
+
+  /** LEADER carrying one `ACAD`/`DSTYLE` override with a 1005 handle value. */
+  const leaderWithDimStyleHandle = (handle: bigint) => ({
+    type: 'LEADER',
+    styleName: '1-40-4',
+    isArrowheadEnabled: true,
+    isSpline: false,
+    leaderCreationFlag: 3,
+    isHooklineSameDirection: true,
+    isHooklineExists: false,
+    vertices: [
+      { x: 0, y: 0, z: 0 },
+      { x: 10, y: 0, z: 0 }
+    ],
+    xdata: [
+      {
+        appName: 'ACAD',
+        value: [
+          { code: 1000, value: 'DSTYLE' },
+          { code: 1002, value: '{' },
+          { code: 1070, value: 41 },
+          { code: 1040, value: 0.08 },
+          { code: 1070, value: 341 },
+          { code: 1005, value: handle },
+          { code: 1002, value: '}' }
+        ]
+      }
+    ]
+  })
+
+  it('keeps DSTYLE DIMLDRBLK handle 0 when LibreDWG emits bigint 1005', () => {
+    // LibreDWG WASM exposes EED group 1005 as bigint, and dropping the value
+    // cleared `(1070 . 341) (1005 . 0)`. That left leaders on the style's
+    // custom Dot block — huge filled circles instead of the closed-filled
+    // arrow AutoCAD draws for that override.
+    acdbHostApplicationServices().workingDatabase = new AcDbDatabase()
+    const converter = new AcDbEntityConverter()
+
+    const result = converter.convert(leaderWithDimStyleHandle(BigInt(0)) as any)
+
+    expect(result).toBeInstanceOf(AcDbLeader)
+    const leader = result as AcDbLeader
+    const acad = [...leader.iterateXData('ACAD')]
+    expect(acad).toEqual(
+      expect.arrayContaining([
+        { code: 1070, value: 341 },
+        { code: 1005, value: '0' }
+      ])
+    )
+  })
+
+  it('encodes a nonzero bigint 1005 handle as uppercase hex, not decimal', () => {
+    // Handle 0 cannot tell hex from decimal apart (both are "0"), so a
+    // decimal-encoded handle would silently point at the wrong object. 0x77A
+    // would become "1914" if the bigint were stringified directly.
+    acdbHostApplicationServices().workingDatabase = new AcDbDatabase()
+    const converter = new AcDbEntityConverter()
+
+    const result = converter.convert(
+      leaderWithDimStyleHandle(BigInt(0x77a)) as any
+    )
+
+    expect(result).toBeInstanceOf(AcDbLeader)
+    const acad = [...(result as AcDbLeader).iterateXData('ACAD')]
+    expect(acad).toEqual(expect.arrayContaining([{ code: 1005, value: '77A' }]))
   })
 
   it('converts MTEXT extentsWidth from libredwg entities', () => {

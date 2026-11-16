@@ -17,8 +17,13 @@ import {
   AcGiRenderer
 } from '@mlightcad/graphic-interface'
 
+import type {
+  AcDbCloneDependencies,
+  AcDbIdMapping
+} from '../../base/AcDbIdMapping.js'
 import { AcDbObjectId } from '../../base/index.js'
 import { AcDbDxfFiler } from '../../base/index.js'
+import type { AcDbBlockTableRecord } from '../../database/AcDbBlockTableRecord.js'
 import { AcDbDatabase } from '../../database/index.js'
 import { AcDbDimStyleTableRecord } from '../../database/index.js'
 import {
@@ -47,7 +52,18 @@ import {
 } from '../AcDbEntityProperties.js'
 import { acdbForEachGripIndex } from '../AcDbGripHelpers.js'
 import { acdbTransformIntersectPrimitives } from '../AcDbIntersectHelpers.js'
+import { acdbUniformScaleFactor } from '../AcDbTransformHelpers.js'
+import {
+  acdbAllocateDimBlockName,
+  acdbDisposeDimBlock
+} from './AcDbDimBlockBuilder.js'
 import { acdbDimFeatureScale } from './AcDbDimFeatureScale.js'
+
+/**
+ * DXF group 70 bit set when the dimension text sits at a user-defined
+ * location instead of its default (home) position.
+ */
+const ACDB_DIM_USER_DEFINED_TEXT_POSITION = 0x80
 
 /**
  * Defines the line spacing style for dimension text.
@@ -136,6 +152,20 @@ export abstract class AcDbDimension extends AcDbEntity {
    * dimension definition points.
    */
   private _dimBlockRotation: number
+  /**
+   * Additional uniform scale applied when placing the anonymous dimension
+   * block. Accumulates the scale of {@link transformBy} so cached block
+   * geometry stays on the scaled definition points until
+   * {@link recomputeDimBlock} regenerates it (which resets it to 1, keeping
+   * text height and arrow size at their dimension-style values like
+   * AutoCAD SCALE).
+   */
+  private _dimBlockScale: number
+  /**
+   * Set by {@link recomputeDimBlock}: {@link dimBlockId} was regenerated from
+   * the definition points and wins over annotative scale-context blocks.
+   */
+  private _dimBlockRegenerated: boolean
 
   /**
    * Creates a new dimension entity.
@@ -167,6 +197,8 @@ export abstract class AcDbDimension extends AcDbEntity {
     this._dxfVersion = 0
     this._normal = new AcGeVector3d(0, 0, 1)
     this._dimBlockRotation = 0
+    this._dimBlockScale = 1
+    this._dimBlockRegenerated = false
   }
 
   /**
@@ -415,6 +447,22 @@ export abstract class AcDbDimension extends AcDbEntity {
   }
 
   /**
+   * Whether the dimension text is at its default (home) position.
+   *
+   * Backed by bit 128 of {@link dimensionType}, which AutoCAD sets once the
+   * text is dragged away from home. When `false`, {@link createDimBlock} keeps
+   * {@link textPosition} instead of recomputing it.
+   */
+  get isUsingDefaultTextPosition() {
+    return (this._dimensionType & ACDB_DIM_USER_DEFINED_TEXT_POSITION) === 0
+  }
+  set isUsingDefaultTextPosition(value: boolean) {
+    this._dimensionType = value
+      ? this._dimensionType & ~ACDB_DIM_USER_DEFINED_TEXT_POSITION
+      : this._dimensionType | ACDB_DIM_USER_DEFINED_TEXT_POSITION
+  }
+
+  /**
    * Attachment point of the dimension text (DXF group 71).
    */
   get attachmentPoint() {
@@ -509,7 +557,19 @@ export abstract class AcDbDimension extends AcDbEntity {
       this._textRotation = Math.atan2(rotationVector.y, rotationVector.x)
     }
 
+    const scale = acdbUniformScaleFactor(matrix)
+    this._dimBlockScale = (this._dimBlockScale ?? 1) * scale
+
     this.subTransformBy(matrix)
+
+    // A scale changes the measured value; keep the cached measurement (used
+    // for the property palette and DXF group 42) in sync with the points.
+    if (this._measurement != null && Math.abs(scale - 1) > 1e-12) {
+      const measured = this.computeMeasurement()
+      if (measured != null && Number.isFinite(measured)) {
+        this._measurement = measured
+      }
+    }
     return this
   }
 
@@ -590,12 +650,21 @@ export abstract class AcDbDimension extends AcDbEntity {
     const isAnnotative = contexts.length > 0 || acdbIsAnnotativeObject(this)
 
     let dimBlockId = this.dimBlockId
-    let blockPosition = this._dimBlockPosition.clone()
+    // Every per-scale `*D` block is stored in WCS like the main one, so all
+    // of them are inserted at the dimension's own block position (DXF 12).
+    // The context's `definitionPoint` is the default text location (DWG
+    // `def_pt`), not an insertion offset: using it shifted the dimension by
+    // its text position (e.g. above the title frame in exported PDFs).
+    const blockPosition = this._dimBlockPosition.clone()
     let preferred: AcDbAnnotationScaleContext | undefined
     let annotationScale: AcDbAnnotationScaleDrawInfo | undefined
     let contextData: AcDbDimensionObjectContextData | undefined
 
-    if (isAnnotative && contexts.length > 0) {
+    if (isAnnotative && contexts.length > 0 && this._dimBlockRegenerated) {
+      const resolved = acdbResolveAnnotationScaleDrawInfo(this)
+      preferred = resolved.preferred
+      annotationScale = resolved.annotationScale
+    } else if (isAnnotative && contexts.length > 0) {
       preferred =
         acdbMatchAnnotationScaleContext(contexts, this.database?.cannoscale) ??
         contexts.find(c => c.isDefault) ??
@@ -605,7 +674,6 @@ export abstract class AcDbDimension extends AcDbEntity {
       if (ctx instanceof AcDbDimensionObjectContextData) {
         contextData = ctx
         if (ctx.blockName) dimBlockId = ctx.blockName
-        blockPosition = ctx.definitionPoint.clone()
       }
     } else {
       const resolved = acdbResolveAnnotationScaleDrawInfo(this)
@@ -770,17 +838,126 @@ export abstract class AcDbDimension extends AcDbEntity {
 
   /**
    * Moves dimension definition and text grip points by the given offset.
+   *
+   * Grip indices follow {@link subGetGripPoints}: definition grips first, the
+   * text grip last. Each dimension type applies AutoCAD's stretch rules through
+   * {@link moveDefinitionGripAt} and {@link moveTextGrip}. Only the definition
+   * data changes; call {@link recomputeDimBlock} afterwards to regenerate the
+   * displayed geometry.
    */
   subMoveGripPointsAt(indices: number[], offset: AcGeVector3dLike) {
-    const definitionPoints = this.collectDimensionDefinitionGripPoints()
+    const definitionGripCount =
+      this.collectDimensionDefinitionGripPoints().length
     acdbForEachGripIndex(indices, index => {
-      if (index >= 0 && index < definitionPoints.length) {
-        definitionPoints[index].add(offset)
-      } else if (index === definitionPoints.length) {
-        this.textPosition.add(offset)
+      if (index < definitionGripCount) {
+        this.moveDefinitionGripAt(index, offset)
+      } else if (index === definitionGripCount) {
+        this.moveTextGrip(offset)
       }
     })
     return this
+  }
+
+  /**
+   * Moves one definition grip. The default moves the point returned by
+   * {@link collectDimensionDefinitionGripPoints} freely.
+   *
+   * @param index - Definition grip index.
+   * @param offset - WCS displacement of the grip.
+   */
+  protected moveDefinitionGripAt(index: number, offset: AcGeVector3dLike) {
+    this.collectDimensionDefinitionGripPoints()[index]?.add(offset)
+  }
+
+  /**
+   * Moves the text grip. The default places the text at the new location and
+   * marks it as user-defined.
+   *
+   * @param offset - WCS displacement of the text grip.
+   */
+  protected moveTextGrip(offset: AcGeVector3dLike) {
+    this.textPosition.add(offset)
+    this.isUsingDefaultTextPosition = false
+  }
+
+  /**
+   * DIMTMOVE of the effective dimension style: 0 moves the dimension line with
+   * the text, 1 adds a leader, 2 moves the text freely.
+   */
+  protected get textMovement(): number {
+    return this.dimensionStyle.dimtmove ?? 0
+  }
+
+  /**
+   * Returns the text position to use while building the dimension block.
+   *
+   * Keeps a user-defined {@link textPosition}; otherwise stores and returns
+   * the supplied default position.
+   *
+   * @param defaultPosition - Home position computed by the dimension type.
+   */
+  protected resolveBlockTextPosition(
+    defaultPosition: AcGePoint3d
+  ): AcGePoint3d {
+    if (!this.isUsingDefaultTextPosition) return this.textPosition.clone()
+    this.textPosition = defaultPosition
+    return defaultPosition
+  }
+
+  /**
+   * Computes the measured value from the current definition points, ignoring
+   * the stored {@link measurement}.
+   *
+   * @returns The measured value, or `undefined` when the type cannot measure.
+   */
+  protected computeMeasurement(): number | undefined {
+    return undefined
+  }
+
+  /**
+   * Builds the anonymous block holding this dimension's graphics from its
+   * current definition points and style. The block is not added to the
+   * database.
+   *
+   * @param blockName - Name of the new block record.
+   */
+  abstract createDimBlock(blockName: string): AcDbBlockTableRecord
+
+  /**
+   * Regenerates the anonymous dimension block after the definition points
+   * changed, like ObjectARX `AcDbDimension::recomputeDimBlock`.
+   *
+   * The measurement is refreshed, a new block is built and added to the
+   * database, and {@link dimBlockId} points at it. The previous block is left
+   * untouched so undo, which restores the old `dimBlockId`, still finds it.
+   *
+   * @param blockName - Block name to use. An existing block with this name is
+   *   replaced (used for transient previews). Defaults to the next free `*D{n}`.
+   * @returns The name of the new block.
+   */
+  recomputeDimBlock(blockName?: string): string {
+    const db = this.database
+    const name = blockName ?? acdbAllocateDimBlockName(db)
+    if (blockName) acdbDisposeDimBlock(db, blockName)
+
+    const measured = this.computeMeasurement()
+    if (measured != null && Number.isFinite(measured)) {
+      this.measurement = measured
+    }
+    // createDimBlock emits WCS geometry, so the block is placed without any
+    // offset or rotation accumulated by earlier MOVE/ROTATE edits.
+    this._dimBlockPosition.set(0, 0, 0)
+    this._dimBlockRotation = 0
+    this._dimBlockScale = 1
+
+    db.tables.blockTable.add(this.createDimBlock(name))
+    this.dimBlockId = name
+    // Annotative dimensions normally draw the block stored in the active
+    // scale context. That context object is shared with the original entity
+    // (grip previews run on clones) and is not part of this entity's undo
+    // snapshot, so the regenerated block is preferred through an own flag.
+    this._dimBlockRegenerated = true
+    return name
   }
 
   /**
@@ -959,7 +1136,7 @@ export abstract class AcDbDimension extends AcDbEntity {
   }
 
   protected getMeasurementPropertyValue(): number | undefined {
-    return this.measurement
+    return this.measurement ?? this.computeMeasurement()
   }
 
   /**
@@ -1213,6 +1390,12 @@ export abstract class AcDbDimension extends AcDbEntity {
     )
 
     const mRot = new AcGeMatrix3d().makeRotationZ(this._dimBlockRotation)
+    const blockScale = this._dimBlockScale ?? 1
+    if (blockScale !== 1) {
+      mRot.multiply(
+        new AcGeMatrix3d().makeScale(blockScale, blockScale, blockScale)
+      )
+    }
 
     // ------------------------------------------------------------
     // Final matrix (OCS space only):
@@ -1236,6 +1419,31 @@ export abstract class AcDbDimension extends AcDbEntity {
    * Subclasses can override this to transform their own definition points.
    */
   protected subTransformBy(_matrix: AcGeMatrix3d) {}
+
+  /**
+   * Adds the dimension style and the dimension block this entity references.
+   *
+   * @param deps - Dependency collector.
+   */
+  override collectCloneDependencies(deps: AcDbCloneDependencies): void {
+    super.collectCloneDependencies(deps)
+    deps.addName('dimStyle', this._dimensionStyleName)
+    deps.addName('block', this._dimBlockId)
+  }
+
+  /**
+   * Translates the dimension style and dimension block names of a clone.
+   *
+   * @param idMap - Id mapping of the current clone operation.
+   */
+  override translateClonedReferences(idMap: AcDbIdMapping): void {
+    super.translateClonedReferences(idMap)
+    this.dimensionStyleName = idMap.translateName(
+      'dimStyle',
+      this._dimensionStyleName
+    )
+    this.dimBlockId = idMap.translateName('block', this._dimBlockId)
+  }
 
   /**
    * Writes DXF fields for this object.

@@ -13,6 +13,10 @@ import {
 import { AcGiEntity, AcGiRenderer } from '@mlightcad/graphic-interface'
 
 import { AcDbDxfFiler } from '../base/AcDbDxfFiler.js'
+import type {
+  AcDbCloneDependencies,
+  AcDbIdMapping
+} from '../base/AcDbIdMapping.js'
 import {
   ByBlock,
   ByLayer,
@@ -32,6 +36,11 @@ import {
   acdbCollectLineSegmentOsnapPoints,
   acdbPickNearestOsnapPoint
 } from './AcDbOsnapHelpers.js'
+import {
+  acdbTransformNormal,
+  acdbTransformVector,
+  acdbUniformScaleFactor
+} from './AcDbTransformHelpers.js'
 
 /**
  * Defines MLINE justification relative to the style element offsets.
@@ -527,13 +536,24 @@ export class AcDbMLine extends AcDbEntity {
    * @returns The same entity instance for chaining.
    */
   transformBy(matrix: AcGeMatrix3d) {
+    // Element offsets and dash / fill parameters are world lengths that
+    // already include the MLINE scale, so they scale with it (AutoCAD SCALE
+    // multiplies the MLINE scale by the factor).
+    const scale = acdbUniformScaleFactor(matrix)
     this._startPosition.applyMatrix4(matrix)
     this._segments.forEach(segment => {
       segment.position.applyMatrix4(matrix)
-      this.transformVector(segment.direction, matrix)
-      this.transformVector(segment.miterDirection, matrix)
+      this.transformDirection(segment.direction, matrix)
+      this.transformDirection(segment.miterDirection, matrix)
+      segment.elements.forEach(element => {
+        element.parameters = element.parameters.map(value => value * scale)
+        element.fillParameters = element.fillParameters.map(
+          value => value * scale
+        )
+      })
     })
-    this.transformVector(this._normal, matrix)
+    this._normal.copy(acdbTransformNormal(this._normal, matrix))
+    this._scale *= scale
     return this
   }
 
@@ -865,6 +885,28 @@ export class AcDbMLine extends AcDbEntity {
 
     if (entities.length === 0) return undefined
     return entities.length === 1 ? entities[0] : renderer.group(entities)
+  }
+
+  /**
+   * Adds the MLINE style this entity references.
+   *
+   * @param deps - Dependency collector.
+   */
+  override collectCloneDependencies(deps: AcDbCloneDependencies): void {
+    super.collectCloneDependencies(deps)
+    deps.addName('mlineStyle', this._styleName)
+  }
+
+  /**
+   * Translates the MLINE style name and style handle of a cloned entity.
+   *
+   * @param idMap - Id mapping of the current clone operation.
+   */
+  override translateClonedReferences(idMap: AcDbIdMapping): void {
+    super.translateClonedReferences(idMap)
+    this._styleName = idMap.translateName('mlineStyle', this._styleName)
+    this._styleObjectHandle =
+      idMap.translateReferenceId(this._styleObjectHandle) ?? ''
   }
 
   /**
@@ -2040,16 +2082,9 @@ export class AcDbMLine extends AcDbEntity {
    * @param vector Vector to transform in place.
    * @param matrix Transformation matrix.
    */
-  private transformVector(vector: AcGeVector3d, matrix: AcGeMatrix3d) {
-    const origin = new AcGePoint3d()
-    const endpoint = new AcGePoint3d(vector.x, vector.y, vector.z)
-    origin.applyMatrix4(matrix)
-    endpoint.applyMatrix4(matrix)
-    vector.set(
-      endpoint.x - origin.x,
-      endpoint.y - origin.y,
-      endpoint.z - origin.z
-    )
+  private transformDirection(vector: AcGeVector3d, matrix: AcGeMatrix3d) {
+    vector.copy(acdbTransformVector(vector, matrix))
+    if (vector.lengthSq() > 0) vector.normalize()
   }
 
   /**

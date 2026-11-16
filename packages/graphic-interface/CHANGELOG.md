@@ -1,5 +1,59 @@
 # @mlightcad/graphic-interface
 
+## 3.15.30
+
+### Patch Changes
+
+- fix: keeps annotative dimensions in place when DWG files carry per-scale context data. Per-scale dimension blocks are now inserted at the dimension's own block position instead of its text location, so dimensions no longer drift away from their geometry in views and exported PDFs, and newly added annotation scales seed the correct text position
+- Updated dependencies
+  - @mlightcad/common@1.15.30
+  - @mlightcad/geometry-engine@3.15.30
+
+## 3.15.29
+
+### Patch Changes
+
+- fix: aligns dimension, multileader and transform editing with AutoCAD, so grip edits rebuild anonymous dimension blocks with the right layout and SCALE keeps linear, diameter and radius dimensions intact. transformBy now scales hatch pattern lines, thickness, polyline widths and annotation sizes across every entity type, DSTYLE overrides that reference a block by handle import from DWG, and bulged polyline area is computed exactly instead of by tessellation, so circle and DONUT centerlines report their true area.
+- Updated dependencies
+  - @mlightcad/common@1.15.29
+  - @mlightcad/geometry-engine@3.15.29
+
+## 3.15.28
+
+### Patch Changes
+
+- fix: improves legacy DWG fidelity so R14 drawings display and link their layouts even without BLOCK_RECORD layout pointers, R13/R14 viewport cameras are read from ACAD/MVIEW xdata, and VIEWPORT view direction comes from the entity body. Layout and block record soft-pointers now stay in sync when handles are reminted, and filling ACADVER keeps all-no-plot R2000+ layers marked as no-plot
+- Updated dependencies
+  - @mlightcad/common@1.15.28
+  - @mlightcad/geometry-engine@3.15.28
+
+## 3.15.27
+
+### Patch Changes
+
+- feat: adds AutoCAD-style deep cloning with wblock and insert so entities and their referenced styles can be copied within or across databases, scopes block render templates by renderer variant and owning database so preview lineweights no longer stick after commit, and stops hatch loops that only touch from being nested incorrectly
+- Updated dependencies
+  - @mlightcad/common@1.15.27
+  - @mlightcad/geometry-engine@3.15.27
+
+## 3.15.26
+
+### Patch Changes
+
+- fix: creates missing layers when entities reference undeclared LAYER table entries so R12-style drawings no longer drop those entities in viewers, and keeps transactions, undo and redo linear for very large edits so undoing a PDF import with hundreds of thousands of entities finishes in seconds instead of timing out or overflowing the call stack
+- Updated dependencies
+  - @mlightcad/common@1.15.26
+  - @mlightcad/geometry-engine@3.15.26
+
+## 3.15.25
+
+### Patch Changes
+
+- fix: corrects pattern hatch spacing so HATCH entities read from DXF no longer keep a second, mis-offset family of strokes beside their definition lines, and stores lines expanded from a predefined pattern with world-space offsets that DXF output rotates by the pattern angle. It also bumps `@mlightcad/libredwg-web` to 0.8.8, whose orphan handling skips entities owned by erased blocks, so stale dimension geometry no longer leaks into drawings read from DWG
+- Updated dependencies
+  - @mlightcad/common@1.15.25
+  - @mlightcad/geometry-engine@3.15.25
+
 ## 3.15.24
 
 ### Patch Changes
