@@ -50,6 +50,14 @@ import {
   AcDbEntityPropertyType,
   AcDbEntityRuntimeProperty
 } from '../AcDbEntityProperties.js'
+import {
+  acdbPoint3dProperties,
+  acdbVector3dProperties
+} from '../AcDbEntityPropertyHelpers.js'
+import {
+  acdbExplodeBlockContent,
+  acdbResolveByBlockProperties
+} from '../AcDbExplodeTransform.js'
 import { acdbForEachGripIndex } from '../AcDbGripHelpers.js'
 import { acdbTransformIntersectPrimitives } from '../AcDbIntersectHelpers.js'
 import { acdbUniformScaleFactor } from '../AcDbTransformHelpers.js'
@@ -744,6 +752,33 @@ export abstract class AcDbDimension extends AcDbEntity {
     userData.annotationScale = resolved
   }
 
+  /**
+   * Explodes this dimension into the entities of its anonymous dimension
+   * block (lines, arcs, multiline text, points and arrowhead block
+   * references), like AutoCAD EXPLODE.
+   *
+   * The parts are placed in WCS with the dimension block transform. Layer `0`
+   * and ByBlock values resolve to the dimension's own properties, so the
+   * exploded geometry looks the same as the dimension. When the dimension has
+   * no block yet, its geometry is generated with {@link createDimBlock}
+   * without adding a block to the database.
+   */
+  protected override subExplode(): AcDbEntity[] {
+    const presentation = this.resolveAnnotativePresentation()
+    let block = this.getDimBlockTableRecord(presentation.dimBlockId)
+    let matrix: AcGeMatrix3d
+    if (block && block.newIterator().count > 0) {
+      matrix = this.getFullDimBlockTransform(presentation.blockPosition)
+    } else {
+      // createDimBlock emits WCS geometry (see recomputeDimBlock).
+      block = this.createDimBlock('*D')
+      matrix = new AcGeMatrix3d()
+    }
+    return acdbExplodeBlockContent(block, matrix).map(part =>
+      acdbResolveByBlockProperties(part, this)
+    )
+  }
+
   /** @inheritdoc */
   override subGetIntersectCurves(): AcGeIntersectPrimitive[] {
     const presentation = this.resolveAnnotativePresentation()
@@ -1005,13 +1040,19 @@ export abstract class AcDbDimension extends AcDbEntity {
           'string',
           () => this.dimBlockId ?? ''
         ),
-        ...this.createPoint3dProperties(
+        // The block position is reset whenever the dimension block is
+        // regenerated, so it is informational only.
+        ...acdbPoint3dProperties(
           'dimBlockPosition',
           () => this.dimBlockPosition
         ),
-        ...this.createPoint3dProperties(
+        ...acdbPoint3dProperties(
           'textPosition',
-          () => this.textPosition
+          () => this.textPosition,
+          value => {
+            this.textPosition = value
+            this.isUsingDefaultTextPosition = false
+          }
         ),
         this.createProperty(
           'textRotation',
@@ -1047,7 +1088,7 @@ export abstract class AcDbDimension extends AcDbEntity {
             }
           ]
         ),
-        ...this.createPoint3dProperties('normal', () => this.normal),
+        ...acdbVector3dProperties('normal', () => this.normal),
         this.createProperty(
           'horizontalRotation',
           'float',
@@ -1056,14 +1097,8 @@ export abstract class AcDbDimension extends AcDbEntity {
             this.horizontalRotation = value
           }
         ),
-        this.createProperty(
-          'dimensionType',
-          'int',
-          () => this.dimensionType,
-          (value: number) => {
-            this.dimensionType = value
-          }
-        ),
+        // Type and flag bits are defined by the dimension class.
+        this.createProperty('dimensionType', 'int', () => this.dimensionType),
         this.createProperty(
           'attachmentPoint',
           'enum',
@@ -1103,36 +1138,17 @@ export abstract class AcDbDimension extends AcDbEntity {
     }
   }
 
+  /**
+   * Creates X/Y/Z properties for a definition point. Editing a coordinate
+   * passes a new point to `setPoint`; the palette regenerates the dimension
+   * block afterwards (see {@link recomputeDimBlock}).
+   */
   protected createPoint3dProperties(
     prefix: string,
-    getPoint: () => AcGePoint3d
+    getPoint: () => AcGePoint3d,
+    setPoint?: (value: AcGePoint3d) => void
   ): AcDbEntityRuntimeProperty<number>[] {
-    return [
-      this.createProperty(
-        `${prefix}X`,
-        'float',
-        () => getPoint().x,
-        (value: number) => {
-          getPoint().x = value
-        }
-      ),
-      this.createProperty(
-        `${prefix}Y`,
-        'float',
-        () => getPoint().y,
-        (value: number) => {
-          getPoint().y = value
-        }
-      ),
-      this.createProperty(
-        `${prefix}Z`,
-        'float',
-        () => getPoint().z,
-        (value: number) => {
-          getPoint().z = value
-        }
-      )
-    ]
+    return acdbPoint3dProperties(prefix, getPoint, setPoint)
   }
 
   protected getMeasurementPropertyValue(): number | undefined {

@@ -15,6 +15,12 @@ import { AcDbDxfFiler } from '../base/AcDbDxfFiler.js'
 import { AcDbOsnapMode } from '../misc/AcDbOsnapMode.js'
 import { AcDbCurve } from './AcDbCurve.js'
 import { AcDbEntityProperties } from './AcDbEntityProperties.js'
+import {
+  acdbCreateProperty,
+  acdbEnumOptions,
+  acdbPointArrayProperty
+} from './AcDbEntityPropertyHelpers.js'
+import { acdbExplodePointPath } from './AcDbExplodeHelpers.js'
 import { acdbForEachGripIndex } from './AcDbGripHelpers.js'
 import { acdbIntersectPrimitivesFromPointPath } from './AcDbIntersectHelpers.js'
 import {
@@ -133,6 +139,21 @@ export class AcDb3dPolyline extends AcDbCurve {
     const vertex = this._geo.vertices[index] as AcGePolyline2dVertex &
       AcGePoint3dLike
     return new AcGePoint3d(vertex.x, vertex.y, vertex.z || 0)
+  }
+
+  /**
+   * Explodes this 3D polyline into one {@link AcDbLine} per segment, like
+   * AutoCAD EXPLODE. Spline-fit polylines are exploded along their stored
+   * vertices, which is the path that is drawn.
+   */
+  protected override subExplode() {
+    const points: AcGePoint3d[] = []
+    for (let i = 0; i < this.numberOfVertices; i++) {
+      points.push(this.getPointAt(i))
+    }
+    return acdbExplodePointPath(points, this.closed).map(line =>
+      line.setPropertiesFrom(this)
+    )
   }
 
   /**
@@ -282,76 +303,47 @@ export class AcDb3dPolyline extends AcDbCurve {
         {
           groupName: 'geometry',
           properties: [
-            {
-              name: 'vertices',
-              type: 'array',
-              editable: false,
-              itemSchema: {
-                properties: [
-                  {
-                    name: 'x',
-                    type: 'float',
-                    editable: true
-                  },
-                  {
-                    name: 'y',
-                    type: 'float',
-                    editable: true
-                  },
-                  {
-                    name: 'z',
-                    type: 'float',
-                    editable: true
-                  }
-                ]
-              },
-              accessor: {
-                get: () => this._geo.vertices
+            acdbPointArrayProperty(
+              'vertices',
+              3,
+              () => this._geo.vertices,
+              points => {
+                if (points.length !== this._geo.numberOfVertices) return
+                this._geo.reset(false)
+                points.forEach((point, index) => {
+                  // 3D vertices keep their z in the shared 2D vertex storage.
+                  const vertex: AcGePolyline2dVertex = new AcGePoint3d(point)
+                  this._geo.addVertexAt(index, vertex)
+                })
               }
-            },
-            {
-              name: 'length',
-              type: 'float',
-              editable: false,
-              accessor: {
-                get: () => this._geo.length
-              }
-            },
-            {
-              name: 'polyType',
-              type: 'int',
-              editable: true,
-              accessor: {
-                get: () => this.polyType,
-                set: (v: number) => {
-                  this.polyType = v
-                }
-              }
-            },
-            {
-              name: 'numberOfVertices',
-              type: 'int',
-              editable: false,
-              accessor: {
-                get: () => this.numberOfVertices
-              }
-            }
+            ),
+            acdbCreateProperty('length', 'float', () => this._geo.length),
+            // Changing the spline-fit type needs regenerated fit vertices.
+            acdbCreateProperty<AcDbPoly3dType>(
+              'polyType',
+              'enum',
+              () => this.polyType,
+              undefined,
+              acdbEnumOptions(AcDbPoly3dType)
+            ),
+            acdbCreateProperty(
+              'numberOfVertices',
+              'int',
+              () => this.numberOfVertices
+            )
           ]
         },
         {
           groupName: 'others',
           properties: [
-            {
-              name: 'closed',
-              type: 'boolean',
-              editable: true,
-              accessor: {
-                get: () => this.closed,
-                set: (v: boolean) => {
-                  this.closed = v
-                }
+            acdbCreateProperty(
+              'closed',
+              'boolean',
+              () => this.closed,
+              (value: boolean) => {
+                this.closed = value
               }
-            }
+            )
           ]
         }
       ]

@@ -53,20 +53,28 @@ import {
   HATCH_PATTERN_SOLID,
   HATCH_PATTERN_USER
 } from '../misc/AcDbConstants.js'
+import { acdbDrawTessellateOptions } from '../misc/AcDbDrawTessellate.js'
 import { AcDbOsnapMode } from '../misc/AcDbOsnapMode.js'
 import { AcDbPredefinedAcadIsoPat } from '../misc/pat/AcDbPatPredefined.js'
 import { AcDbHatchScaleContextData } from '../object/AcDbHatchScaleContextData.js'
 import { AcDbEntity } from './AcDbEntity.js'
 import { AcDbEntityProperties } from './AcDbEntityProperties.js'
 import {
+  acdbCreateProperty,
+  acdbVector3dProperties
+} from './AcDbEntityPropertyHelpers.js'
+import {
   acdbForEachGripIndex,
   acdbMovePolyline2dVertexAt
 } from './AcDbGripHelpers.js'
+import { acdbTessellateHatchPattern } from './AcDbHatchPatternHelpers.js'
 import { acdbIntersectPrimitivesFromAreaLoops } from './AcDbIntersectHelpers.js'
+import { AcDbLine } from './AcDbLine.js'
 import {
   acdbCollectPolyline2dSegmentOsnapPoints,
   acdbPickNearestOsnapPoint
 } from './AcDbOsnapHelpers.js'
+import { AcDbPoint } from './AcDbPoint.js'
 
 /**
  * Defines the type of hatch pattern.
@@ -1186,7 +1194,7 @@ export class AcDbHatch extends AcDbEntity {
               accessor: {
                 get: () => this.patternScale,
                 set: (v: number) => {
-                  this.patternScale = v
+                  if (Number.isFinite(v) && v > 0) this.patternScale = v
                 }
               }
             },
@@ -1242,17 +1250,13 @@ export class AcDbHatch extends AcDbEntity {
                 get: () => this.isGradient
               }
             },
-            {
-              name: 'isSolidFill',
-              type: 'boolean',
-              editable: true,
-              accessor: {
-                get: () => this.isSolidFill,
-                set: (v: boolean) => {
-                  this.isSolidFill = v
-                }
-              }
-            },
+            // Solid fill follows the pattern name (SOLID); choose the pattern
+            // instead of toggling the flag.
+            acdbCreateProperty(
+              'isSolidFill',
+              'boolean',
+              () => this.isSolidFill
+            ),
             {
               name: 'hatchStyle',
               type: 'enum',
@@ -1345,28 +1349,36 @@ export class AcDbHatch extends AcDbEntity {
                 }
               }
             },
-            {
-              name: 'gradientStartColor',
-              type: 'int',
-              editable: true,
-              accessor: {
-                get: () => this.gradientStartColor ?? 0,
-                set: (v: number) => {
-                  this.gradientStartColor = v
-                }
+            // Gradient colors are stored as packed RGB; the palette edits
+            // them as true colors.
+            acdbCreateProperty<AcCmColor | undefined>(
+              'gradientStartColor',
+              'color',
+              () => {
+                const rgb = this.gradientStartColor
+                return rgb == null
+                  ? undefined
+                  : new AcCmColor().setRGBValue(rgb)
+              },
+              (value: AcCmColor | undefined) => {
+                this.gradientStartColor = value?.RGB
               }
-            },
-            {
-              name: 'gradientEndColor',
-              type: 'int',
-              editable: true,
-              accessor: {
-                get: () => this.gradientEndColor ?? 0,
-                set: (v: number) => {
-                  this.gradientEndColor = v
-                }
+            ),
+            // Gradient colors are stored as packed RGB; the palette edits
+            // them as true colors.
+            acdbCreateProperty<AcCmColor | undefined>(
+              'gradientEndColor',
+              'color',
+              () => {
+                const rgb = this.gradientEndColor
+                return rgb == null
+                  ? undefined
+                  : new AcCmColor().setRGBValue(rgb)
+              },
+              (value: AcCmColor | undefined) => {
+                this.gradientEndColor = value?.RGB
               }
-            },
+            ),
             {
               name: 'hatchObjectType',
               type: 'enum',
@@ -1377,7 +1389,8 @@ export class AcDbHatch extends AcDbEntity {
                   value: AcDbHatchObjectType.HatchObject
                 },
                 {
-                  label: AcDbHatchObjectType[AcDbHatchObjectType.GradientObject],
+                  label:
+                    AcDbHatchObjectType[AcDbHatchObjectType.GradientObject],
                   value: AcDbHatchObjectType.GradientObject
                 }
               ],
@@ -1412,39 +1425,7 @@ export class AcDbHatch extends AcDbEntity {
                 get: () => this.area
               }
             },
-            {
-              name: 'normalX',
-              type: 'float',
-              editable: true,
-              accessor: {
-                get: () => this.normal.x,
-                set: (v: number) => {
-                  this.normal.x = v
-                }
-              }
-            },
-            {
-              name: 'normalY',
-              type: 'float',
-              editable: true,
-              accessor: {
-                get: () => this.normal.y,
-                set: (v: number) => {
-                  this.normal.y = v
-                }
-              }
-            },
-            {
-              name: 'normalZ',
-              type: 'float',
-              editable: true,
-              accessor: {
-                get: () => this.normal.z,
-                set: (v: number) => {
-                  this.normal.z = v
-                }
-              }
-            }
+            ...acdbVector3dProperties('normal', () => this.normal)
           ]
         }
       ]
@@ -1942,8 +1923,7 @@ export class AcDbHatch extends AcDbEntity {
   } {
     const baseScale = this.getEffectivePatternScale()
     const contexts = acdbGetAnnotationScaleContexts(this)
-    const isAnnotative =
-      contexts.length > 0 || acdbIsAnnotativeObject(this)
+    const isAnnotative = contexts.length > 0 || acdbIsAnnotativeObject(this)
 
     let patternScale = baseScale
     let preferred: AcDbAnnotationScaleContext | undefined
@@ -1951,18 +1931,12 @@ export class AcDbHatch extends AcDbEntity {
 
     if (isAnnotative && contexts.length > 0) {
       preferred =
-        acdbMatchAnnotationScaleContext(
-          contexts,
-          this.database?.cannoscale
-        ) ??
+        acdbMatchAnnotationScaleContext(contexts, this.database?.cannoscale) ??
         contexts.find(c => c.isDefault) ??
         contexts[0]
       annotationScale = acdbBuildAnnotationScaleDrawInfo(contexts, preferred)
       const ctx = preferred.contextData
-      if (
-        ctx instanceof AcDbHatchScaleContextData &&
-        ctx.patternScale > 0
-      ) {
+      if (ctx instanceof AcDbHatchScaleContextData && ctx.patternScale > 0) {
         patternScale = ctx.patternScale
       } else {
         patternScale = acdbAnnotativeModelHeight(
@@ -2032,6 +2006,61 @@ export class AcDbHatch extends AcDbEntity {
         userData.annotationScale = info
       }
       return drawable
+    } finally {
+      this._patternScale = savedScale
+      this._patternScaleSet = savedSet
+      this.updatePredefinedPatternDefinitionLines()
+    }
+  }
+
+  /**
+   * Explodes this hatch like AutoCAD EXPLODE: a pattern hatch becomes the
+   * individual pattern lines clipped to its boundary (dots become points),
+   * placed in the hatch plane and carrying the hatch's properties. The
+   * boundary itself is not part of the result.
+   *
+   * Solid-fill and gradient hatches have no pattern lines and cannot be
+   * exploded.
+   */
+  protected override subExplode(): AcDbEntity[] | undefined {
+    if (this.isSolidFill || this.isGradient) return undefined
+    const presentation = this.resolveAnnotativePresentation()
+    const savedScale = this._patternScale
+    const savedSet = this._patternScaleSet
+    this._patternScale = presentation.patternScale
+    this._patternScaleSet = true
+    try {
+      this.updatePredefinedPatternDefinitionLines()
+      const definitionLines = this.definitionLines
+      if (definitionLines.length === 0) return undefined
+      const patternAngle = this.getRenderablePatternAngle()
+      const options = acdbDrawTessellateOptions({
+        context: { database: this.database }
+      })
+      const areas = this.buildAreasFromLoops()
+      const toWcs = (x: number, y: number) =>
+        acgeTransformOcsPointToWcs({ x, y, z: this._elevation }, this._normal)
+
+      const parts: AcDbEntity[] = []
+      for (const area of areas.length > 0 ? areas : [this._geo]) {
+        const loops = area.tessellate(options)
+        for (const [a, b] of acdbTessellateHatchPattern(
+          loops,
+          definitionLines,
+          patternAngle
+        )) {
+          let part: AcDbEntity
+          if (a.x === b.x && a.y === b.y) {
+            const point = new AcDbPoint()
+            point.position = toWcs(a.x, a.y)
+            part = point
+          } else {
+            part = new AcDbLine(toWcs(a.x, a.y), toWcs(b.x, b.y))
+          }
+          parts.push(part.setPropertiesFrom(this))
+        }
+      }
+      return parts
     } finally {
       this._patternScale = savedScale
       this._patternScaleSet = savedSet

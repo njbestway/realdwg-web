@@ -23,6 +23,23 @@ export { AcDbCircle } from './AcDbCircle.js'
 export { AcDbCurve } from './AcDbCurve.js'
 export { AcDbEllipse } from './AcDbEllipse.js'
 export { AcDbEntity } from './AcDbEntity.js'
+export {
+  acdbExplodeBulgePath,
+  acdbExplodePointPath,
+  acdbMTextToPlainParagraphs
+} from './AcDbExplodeHelpers.js'
+export type {
+  AcDbBulgePathVertex,
+  AcDbExplodeBulgePathOptions
+} from './AcDbExplodeHelpers.js'
+export {
+  acdbExplodeBlockContent,
+  acdbIsConformalInPlane,
+  acdbResolveByBlockProperties,
+  acdbTransformForExplode
+} from './AcDbExplodeTransform.js'
+export { acdbTessellateHatchPattern } from './AcDbHatchPatternHelpers.js'
+export type { AcDbHatchPatternSegment } from './AcDbHatchPatternHelpers.js'
 export type {
   AcDbEntityArrayItemSchema,
   AcDbEntityProperties,
@@ -33,6 +50,17 @@ export type {
   AcDbEntityRuntimeProperty,
   AcDbPropertyAccessor
 } from './AcDbEntityProperties.js'
+export {
+  acdbCreateProperty,
+  acdbEnumOptions,
+  acdbPoint3dProperties,
+  acdbPointArrayProperty,
+  acdbVector3dProperties
+} from './AcDbEntityPropertyHelpers.js'
+export type {
+  AcDbEntityPropertyOption,
+  AcDbPointArrayItem
+} from './AcDbEntityPropertyHelpers.js'
 export { AcDbFace } from './AcDbFace.js'
 export { AcDbFcf } from './AcDbFcf.js'
 export {
@@ -45,7 +73,11 @@ export {
 export type { AcDbGradientName } from './AcDbHatch.js'
 export { AcDbLeader, AcDbLeaderAnnotationType } from './AcDbLeader.js'
 export { AcDbLine } from './AcDbLine.js'
-export { AcDbMLine, AcDbMLineFlags, AcDbMLineJustification } from './AcDbMLine.js'
+export {
+  AcDbMLine,
+  AcDbMLineFlags,
+  AcDbMLineJustification
+} from './AcDbMLine.js'
 export type {
   AcDbMLineElement,
   AcDbMLineElementLike,
@@ -74,6 +106,7 @@ export type {
   AcDbMLeaderMTextContent,
   AcDbMLeaderMTextContentLike
 } from './AcDbMLeader.js'
+export { AcDbMInsertBlock } from './AcDbMInsertBlock.js'
 export { AcDbMText } from './AcDbMText.js'
 export { AcDbFrame } from './AcDbFrame.js'
 export { AcDbOleFrame } from './AcDbOleFrame.js'

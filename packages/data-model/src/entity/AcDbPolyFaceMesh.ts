@@ -12,10 +12,15 @@ import { AcGiRenderer } from '@mlightcad/graphic-interface'
 import { AcDbDxfFiler } from '../base/AcDbDxfFiler.js'
 import { AcDbOsnapMode } from '../misc/AcDbOsnapMode.js'
 import { AcDbCurve } from './AcDbCurve.js'
+import { AcDbEntity } from './AcDbEntity.js'
 import { AcDbEntityProperties } from './AcDbEntityProperties.js'
+import { acdbPointArrayProperty } from './AcDbEntityPropertyHelpers.js'
+import { AcDbFace } from './AcDbFace.js'
 import { acdbForEachGripIndex } from './AcDbGripHelpers.js'
 import { acdbIntersectPrimitivesFromPointPath } from './AcDbIntersectHelpers.js'
-import { acdbOffsetVertexPathAsPolyline,AcDbPolyline } from './AcDbPolyline.js'
+import { AcDbLine } from './AcDbLine.js'
+import { AcDbPoint } from './AcDbPoint.js'
+import { acdbOffsetVertexPathAsPolyline, AcDbPolyline } from './AcDbPolyline.js'
 
 /**
  * Represents a polyface mesh vertex in AutoCAD.
@@ -234,6 +239,51 @@ export class AcDbPolyFaceMesh extends AcDbCurve {
   }
 
   /**
+   * Explodes this polyface mesh like AutoCAD EXPLODE: every face with three
+   * or four vertices becomes an {@link AcDbFace} (3D face), keeping the
+   * invisible edges marked by negative vertex indices; a face with two
+   * vertices becomes an {@link AcDbLine} and one with a single vertex an
+   * {@link AcDbPoint}.
+   */
+  protected override subExplode(): AcDbEntity[] {
+    const parts: AcDbEntity[] = []
+    for (const face of this._faces) {
+      const corners: { position: AcGePoint3d; visible: boolean }[] = []
+      for (const index of face.vertexIndices) {
+        const vertex = this._vertices[Math.abs(index) - 1]
+        if (index === 0 || !vertex) continue
+        corners.push({ position: vertex.position, visible: index > 0 })
+      }
+      if (corners.length >= 3) {
+        const solid = new AcDbFace()
+        for (let i = 0; i < 4; i++) {
+          solid.setVertexAt(
+            i,
+            corners[Math.min(i, corners.length - 1)].position
+          )
+        }
+        corners.slice(0, 4).forEach((corner, i) => {
+          if (!corner.visible) solid.makeEdgeInvisibleAt(i)
+        })
+        // A triangle repeats its third vertex as the fourth one, so its
+        // closing edge (third vertex back to the first) is 3DFACE edge 3,
+        // while edge 2 has zero length.
+        if (corners.length === 3 && !corners[2].visible) {
+          solid.makeEdgeInvisibleAt(3)
+        }
+        parts.push(solid)
+      } else if (corners.length === 2) {
+        parts.push(new AcDbLine(corners[0].position, corners[1].position))
+      } else if (corners.length === 1) {
+        const point = new AcDbPoint()
+        point.position = corners[0].position
+        parts.push(point)
+      }
+    }
+    return parts.map(part => part.setPropertiesFrom(this))
+  }
+
+  /**
    * Returns the full property definition for this mesh entity.
    */
   get properties(): AcDbEntityProperties {
@@ -244,38 +294,17 @@ export class AcDbPolyFaceMesh extends AcDbCurve {
         {
           groupName: 'geometry',
           properties: [
-            {
-              name: 'vertices',
-              type: 'array',
-              editable: false,
-              itemSchema: {
-                properties: [
-                  {
-                    name: 'x',
-                    type: 'float',
-                    editable: true
-                  },
-                  {
-                    name: 'y',
-                    type: 'float',
-                    editable: true
-                  },
-                  {
-                    name: 'z',
-                    type: 'float',
-                    editable: true
-                  }
-                ]
-              },
-              accessor: {
-                get: () =>
-                  this._vertices.map(v => ({
-                    x: v.position.x,
-                    y: v.position.y,
-                    z: v.position.z
-                  }))
+            acdbPointArrayProperty(
+              'vertices',
+              3,
+              () => this._vertices.map(vertex => vertex.position),
+              points => {
+                if (points.length !== this._vertices.length) return
+                points.forEach((point, index) =>
+                  this._vertices[index].position.copy(point)
+                )
               }
-            },
+            ),
             {
               name: 'faces',
               type: 'array',

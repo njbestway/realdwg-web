@@ -20,6 +20,13 @@ import { AcDbOsnapMode } from '../misc/AcDbOsnapMode.js'
 import { AcDbCurve } from './AcDbCurve.js'
 import { AcDbEntityProperties } from './AcDbEntityProperties.js'
 import {
+  acdbCreateProperty,
+  acdbEnumOptions,
+  acdbPointArrayProperty,
+  acdbVector3dProperties
+} from './AcDbEntityPropertyHelpers.js'
+import { acdbExplodeBulgePath } from './AcDbExplodeHelpers.js'
+import {
   acdbForEachGripIndex,
   acdbMovePolyline2dVertexAt
 } from './AcDbGripHelpers.js'
@@ -231,6 +238,23 @@ export class AcDb2dPolyline extends AcDbCurve {
   }
 
   /**
+   * Explodes this polyline into one {@link AcDbLine} or {@link AcDbArc} per
+   * segment, like AutoCAD EXPLODE.
+   *
+   * Curve-fit and spline-fit polylines are exploded along their stored
+   * vertices, which is the path that is drawn. The generated entities keep the
+   * elevation, normal and general properties of the polyline; segment widths
+   * are discarded, as in AutoCAD.
+   */
+  protected override subExplode() {
+    return acdbExplodeBulgePath(this._geo.vertices, {
+      closed: this.closed,
+      elevation: this._elevation,
+      normal: this._normal
+    }).map(curve => curve.setPropertiesFrom(this))
+  }
+
+  /**
    * Gets the geometric extents (bounding box) of this polyline.
    *
    * @returns The bounding box that encompasses the entire polyline
@@ -419,115 +443,63 @@ export class AcDb2dPolyline extends AcDbCurve {
         {
           groupName: 'geometry',
           properties: [
-            {
-              name: 'vertices',
-              type: 'array',
-              editable: false,
-              itemSchema: {
-                properties: [
-                  {
-                    name: 'x',
-                    type: 'float',
-                    editable: true
-                  },
-                  {
-                    name: 'y',
-                    type: 'float',
-                    editable: true
-                  }
-                ]
+            acdbPointArrayProperty(
+              'vertices',
+              2,
+              () => this._geo.vertices,
+              items => {
+                if (items.length !== this._geo.numberOfVertices) return
+                const current = this._geo.vertices
+                this._geo.reset(false)
+                items.forEach((item, index) =>
+                  this._geo.addVertexAt(index, {
+                    ...current[index],
+                    x: item.x,
+                    y: item.y,
+                    bulge: item.bulge || undefined
+                  })
+                )
               },
-              accessor: {
-                get: () => this._geo.vertices
+              ['bulge']
+            ),
+            acdbCreateProperty(
+              'elevation',
+              'float',
+              () => this.elevation,
+              (value: number) => {
+                this.elevation = value
               }
-            },
-            {
-              name: 'elevation',
-              type: 'float',
-              editable: true,
-              accessor: {
-                get: () => this.elevation,
-                set: (v: number) => {
-                  this.elevation = v
-                }
-              }
-            },
-            {
-              name: 'length',
-              type: 'float',
-              editable: false,
-              accessor: {
-                get: () => this._geo.length
-              }
-            },
-            {
-              name: 'polyType',
-              type: 'int',
-              editable: true,
-              accessor: {
-                get: () => this.polyType,
-                set: (v: number) => {
-                  this.polyType = v
-                }
-              }
-            },
-            {
-              name: 'normalX',
-              type: 'float',
-              editable: true,
-              accessor: {
-                get: () => this.normal.x,
-                set: (v: number) => {
-                  this.normal.x = v
-                }
-              }
-            },
-            {
-              name: 'normalY',
-              type: 'float',
-              editable: true,
-              accessor: {
-                get: () => this.normal.y,
-                set: (v: number) => {
-                  this.normal.y = v
-                }
-              }
-            },
-            {
-              name: 'normalZ',
-              type: 'float',
-              editable: true,
-              accessor: {
-                get: () => this.normal.z,
-                set: (v: number) => {
-                  this.normal.z = v
-                }
-              }
-            },
-            {
-              name: 'numberOfVertices',
-              type: 'int',
-              editable: false,
-              accessor: {
-                get: () => this.numberOfVertices
-              }
-            }
+            ),
+            acdbCreateProperty('length', 'float', () => this._geo.length),
+            acdbCreateProperty('area', 'float', () => this.area),
+            // Switching the fit type would need the fit/spline vertices to be
+            // regenerated, so the type is informational only.
+            acdbCreateProperty<AcDbPoly2dType>(
+              'polyType',
+              'enum',
+              () => this.polyType,
+              undefined,
+              acdbEnumOptions(AcDbPoly2dType)
+            ),
+            ...acdbVector3dProperties('normal', () => this.normal),
+            acdbCreateProperty(
+              'numberOfVertices',
+              'int',
+              () => this.numberOfVertices
+            )
           ]
         },
         {
           groupName: 'others',
           properties: [
-            {
-              name: 'closed',
-              type: 'boolean',
-              editable: true,
-              accessor: {
-                get: () => this.closed,
-                set: (v: boolean) => {
-                  this.closed = v
-                }
+            acdbCreateProperty(
+              'closed',
+              'boolean',
+              () => this.closed,
+              (value: boolean) => {
+                this.closed = value
               }
-            }
+            )
           ]
         }
       ]
