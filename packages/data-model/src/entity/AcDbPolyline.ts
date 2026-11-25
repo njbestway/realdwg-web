@@ -882,9 +882,17 @@ export class AcDbPolyline extends AcDbCurve {
     if (this._normal.x === 0 && this._normal.y === 0 && this._normal.z === 1) {
       return
     }
+    // Adjacent segment quads reuse the exact same joint vertex object (see
+    // addOpenWidePolylineBand). Mirroring in place on every loop visit would
+    // transform shared joints twice -- flipping them back to OCS -- while
+    // single-quad endpoints end up WCS, tearing the band across the drawing.
+    // Transform each unique vertex object exactly once.
+    const mapped = new WeakSet<AcGePolyline2dVertex>()
     for (const loop of area.loops) {
       if (!('vertices' in loop)) continue
       for (const vertex of loop.vertices) {
+        if (mapped.has(vertex)) continue
+        mapped.add(vertex)
         const wcs = this.ocsPointToWcs(vertex.x, vertex.y)
         vertex.x = wcs.x
         vertex.y = wcs.y

@@ -989,3 +989,75 @@ describe('AcDbPolyline', () => {
     ])
   })
 })
+
+describe('AcDbPolyline OCS mirror (-Z) wide band', () => {
+  it('mirrors shared segment-quad joints exactly once when mapping area loops to WCS', () => {
+    const polyline = new AcDbPolyline()
+    // Strictly negative OCS x so every WCS boundary point (centerline +/-
+    // half width) stays positive after the -Z mirror.
+    const ocs = [
+      { x: -100, y: 0 },
+      { x: -60, y: 10 },
+      { x: -20, y: 10 },
+      { x: -10, y: 40 }
+    ]
+    ocs.forEach((p, i) =>
+      polyline.addVertexAt(i, new AcGePoint2d(p.x, p.y), 0, 2, 2)
+    )
+    polyline.normal = new AcGeVector3d(0, 0, -1)
+
+    type PointLike = { x: number; y: number }
+    type LoopLike = { vertices?: PointLike[] }
+    const areas: { loops: LoopLike[] }[] = []
+    const strokes: PointLike[][] = []
+    const renderer = {
+      subEntityTraits: {},
+      area: (a: { loops: LoopLike[] }) => {
+        areas.push(a)
+        return {}
+      },
+      lines: (pts: PointLike[]) => {
+        strokes.push(pts)
+        return {}
+      },
+      offsetRing: (outer: PointLike[], inner: PointLike[]) => {
+        strokes.push(outer, inner)
+        return {}
+      },
+      group: (entities: unknown) => entities
+    }
+    polyline.subWorldDraw(
+      renderer as unknown as Parameters<AcDbPolyline['subWorldDraw']>[0]
+    )
+
+    // The open wide band must reach the renderer as a segment-quad chain.
+    expect(areas.length).toBeGreaterThan(0)
+    const loops = areas
+      .flatMap(a => a.loops)
+      .filter((l): l is { vertices: PointLike[] } => 'vertices' in l)
+    expect(loops.length).toBeGreaterThan(1)
+
+    // Neighboring quads reuse the same joint vertex object. Mirroring in
+    // place on every loop visit transformed shared joints twice (back to
+    // OCS, negative x) while single-quad endpoints ended up WCS, tearing
+    // the band across the drawing (大海则煤矿 河流 polyline 39AA85D).
+    const seen = new Set<PointLike>()
+    let sharedVisits = 0
+    for (const loop of loops) {
+      for (const vertex of loop.vertices) {
+        if (seen.has(vertex)) sharedVisits++
+        seen.add(vertex)
+        expect(vertex.x).toBeGreaterThan(0)
+        expect(vertex.y).toBeGreaterThanOrEqual(-2)
+        expect(vertex.y).toBeLessThanOrEqual(42)
+      }
+    }
+    expect(sharedVisits).toBeGreaterThan(0)
+
+    // The companion centerline stroke is fully WCS as well.
+    expect(strokes.length).toBeGreaterThan(0)
+    for (const pts of strokes) {
+      for (const p of pts) expect(p.x).toBeGreaterThan(0)
+    }
+  })
+})
