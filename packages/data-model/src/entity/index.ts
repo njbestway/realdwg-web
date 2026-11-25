@@ -46,6 +46,30 @@ export type {
   AcDbJoinableCurve
 } from './AcDbJoinHelpers.js'
 export {
+  acdbFilletPolyline,
+  acdbFilletTwoEntities,
+  acdbIsFilletableEntity,
+  acdbPreviewFilletTwoEntities
+} from './AcDbFilletHelpers.js'
+export type {
+  AcDbFilletOptions,
+  AcDbFilletPolylineResult,
+  AcDbFilletTwoResult,
+  AcDbFilletableEntity
+} from './AcDbFilletHelpers.js'
+export {
+  acdbChamferPolyline,
+  acdbChamferTwoEntities,
+  acdbIsChamferableEntity,
+  acdbPreviewChamferTwoEntities
+} from './AcDbChamferHelpers.js'
+export type {
+  AcDbChamferOptions,
+  AcDbChamferPolylineResult,
+  AcDbChamferTwoResult,
+  AcDbChamferableEntity
+} from './AcDbChamferHelpers.js'
+export {
   acdbExplodeBlockContent,
   acdbIsConformalInPlane,
   acdbResolveByBlockProperties,
@@ -120,6 +144,11 @@ export type {
   AcDbMLeaderMTextContentLike
 } from './AcDbMLeader.js'
 export { AcDbMInsertBlock } from './AcDbMInsertBlock.js'
+export {
+  acdbApplyMTextMirrtextPolicy,
+  acdbApplyTextMirrtextPolicy,
+  acdbResolveMirrtext
+} from './AcDbMirrtext.js'
 export { AcDbMText } from './AcDbMText.js'
 export { AcDbFrame } from './AcDbFrame.js'
 export { AcDbOleFrame } from './AcDbOleFrame.js'

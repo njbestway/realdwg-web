@@ -59,6 +59,11 @@ import {
 
 import { AcDbEntityConverter } from './AcDbEntitiyConverter.js'
 import {
+  convertLibreDwgAssocObjects,
+  type LibreDwgAssocObjects,
+  linkLibreDwgAssocNetworkDictionary,
+  linkLibreDwgAssocReactors} from './AcDbLibreDwgAssocConverter.js'
+import {
   AcDbObjectConverter,
   type LibreDwgAnnotScaleContextDataObject,
   type LibreDwgBlkRefObjectContextDataObject,
@@ -628,6 +633,15 @@ export class AcDbLibreDwgConverter extends AcDbDatabaseConverter<DwgDatabase> {
         await progress(percentage, 'ENTITY', 'IN-PROGRESS')
       }
     })
+
+    // Dependencies attach to their objects as persistent reactors; entities
+    // only exist now.
+    linkLibreDwgAssocReactors(this.assocObjects(model), db)
+  }
+
+  /** Assoc collections of `model` (absent in older libredwg-web releases). */
+  private assocObjects(model: DwgDatabase): LibreDwgAssocObjects {
+    return model.objects as unknown as LibreDwgAssocObjects
   }
 
   protected processClasses(model: DwgDatabase, db: AcDbDatabase) {
@@ -679,6 +693,22 @@ export class AcDbLibreDwgConverter extends AcDbDatabaseConverter<DwgDatabase> {
     db.insunits = header.INSUNITS ?? 1
     db.pdmode = header.PDMODE ?? 0
     db.pdsize = header.PDSIZE ?? 0.0
+    const mirrtext = (header as { MIRRTEXT?: number }).MIRRTEXT
+    if (mirrtext != null) {
+      db.mirrtext = mirrtext
+    }
+    const headerExt = header as {
+      FILLETRAD?: number
+      CHAMFERA?: number
+      CHAMFERB?: number
+      CHAMFERC?: number
+      CHAMFERD?: number
+    }
+    if (headerExt.FILLETRAD != null) db.filletrad = headerExt.FILLETRAD
+    if (headerExt.CHAMFERA != null) db.chamfera = headerExt.CHAMFERA
+    if (headerExt.CHAMFERB != null) db.chamferb = headerExt.CHAMFERB
+    if (headerExt.CHAMFERC != null) db.chamferc = headerExt.CHAMFERC
+    if (headerExt.CHAMFERD != null) db.chamferd = headerExt.CHAMFERD
     db.textstyle = header.TEXTSTYLE ?? DEFAULT_TEXT_STYLE
     // Match DXF header reader: new dimensions must inherit $DIMSTYLE.
     // Without this, DWG loads leave db.dimstyle as the constructor default
@@ -725,7 +755,19 @@ export class AcDbLibreDwgConverter extends AcDbDatabaseConverter<DwgDatabase> {
     this.processLayerIndexes(model, db)
     this.processLayerFilterTree(model, db)
     this.processMLeaderStyles(model, db)
+    // Assoc objects must be resident before dictionaries are materialized so
+    // ACAD_ASSOCNETWORK entries (NOD and space-block xdicts) resolve.
+    const assocObjects = this.assocObjects(model)
+    convertLibreDwgAssocObjects(assocObjects, db)
     this.processDynBlockMetadata(model, db)
+    linkLibreDwgAssocNetworkDictionary(
+      assocObjects,
+      (model.objects.DICTIONARY ?? []).map(dict => ({
+        handle: String(dict.handle ?? ''),
+        ownerHandle: String(dict.ownerHandle ?? '')
+      })),
+      db
+    )
     this.finishCannoscale(model, db)
     this.finishAnnoallvisible(model, db)
   }

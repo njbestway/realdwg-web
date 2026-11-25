@@ -33,6 +33,9 @@ import {
   ACDB_COMPAREHATCH_DEFAULT,
   ACDB_COMPAREHATCH_MAX,
   ACDB_COMPAREHATCH_MIN,
+  ACDB_MIRRTEXT_DEFAULT,
+  ACDB_MIRRTEXT_MAX,
+  ACDB_MIRRTEXT_MIN,
   ACDB_COMPARERCMARGIN_DEFAULT,
   ACDB_COMPARERCMARGIN_MAX,
   ACDB_COMPARERCMARGIN_MIN,
@@ -60,6 +63,7 @@ import { AcDbLinearUnits } from '../misc/AcDbLinearUnits.js'
 import { AcDbUnitsValue } from '../misc/AcDbUnitsValue.js'
 import { AcDbDictionary } from '../object/AcDbDictionary.js'
 import { AcDbDictionaryVar } from '../object/AcDbDictionaryVar.js'
+import { AcDbAssocManager } from '../object/assoc/AcDbAssocManager.js'
 import { AcDbGroup } from '../object/AcDbGroup.js'
 import { AcDbLayerFilter } from '../object/AcDbLayerFilter.js'
 import { AcDbLayerIndex } from '../object/AcDbLayerIndex.js'
@@ -175,7 +179,13 @@ const DXF_HEADER_NATIVE_VARS = new Set([
   '$PDMODE',
   '$PDSIZE',
   '$OSMODE',
-  '$ORTHOMODE'
+  '$ORTHOMODE',
+  '$MIRRTEXT',
+  '$FILLETRAD',
+  '$CHAMFERA',
+  '$CHAMFERB',
+  '$CHAMFERC',
+  '$CHAMFERD'
 ])
 
 /**
@@ -414,6 +424,19 @@ function appendAll(target: AcDbEntity[], entity: AcDbEntity | AcDbEntity[]) {
  * const entities = database.tables.blockTable.modelSpace.entities;
  * ```
  */
+/**
+ * DXF record name → C++ class name of the ObjectDBX classes data-model can
+ * create natively (CLASSES section entries, app name `ObjectDBX Classes`).
+ */
+const ACDB_OBJECTDBX_CLASSES: Record<string, string> = {
+  ACDBASSOCNETWORK: 'AcDbAssocNetwork',
+  ACDBASSOCACTION: 'AcDbAssocAction',
+  ACDBASSOCARRAYACTIONBODY: 'AcDbAssocArrayActionBody',
+  ACDBASSOCDEPENDENCY: 'AcDbAssocDependency',
+  ACDBASSOCVERTEXACTIONPARAM: 'AcDbAssocVertexActionParam',
+  ACDBASSOCEDGEACTIONPARAM: 'AcDbAssocEdgeActionParam'
+}
+
 export class AcDbDatabase extends AcDbObject {
   /** Sequence counter for default unsaved drawing names (Drawing1.dwg, Drawing2.dwg, ...). */
   private static _unsavedDrawingSequence = 0
@@ -491,6 +514,18 @@ export class AcDbDatabase extends AcDbObject {
   private _osmode: number
   /** Orthogonal mode flag (ORTHOMODE): 0 = off, 1 = on */
   private _orthomode: number
+  /** MIRRTEXT: whether TEXT/MTEXT are truly mirrored by MIRROR (0 = readable) */
+  private _mirrtext: number
+  /** FILLETRAD: current 2D fillet radius */
+  private _filletrad: number
+  /** CHAMFERA: first chamfer distance (CHAMMODE = 0) */
+  private _chamfera: number
+  /** CHAMFERB: second chamfer distance (CHAMMODE = 0) */
+  private _chamferb: number
+  /** CHAMFERC: chamfer length (CHAMMODE = 1) */
+  private _chamferc: number
+  /** CHAMFERD: chamfer angle in degrees (CHAMMODE = 1) */
+  private _chamferd: number
   /** COMPAREHATCH: whether hatch objects are included in drawing comparison */
   private _comparehatch: number
   /** COMPARERCMARGIN: revision-cloud offset around comparison change sets */
@@ -664,6 +699,12 @@ export class AcDbDatabase extends AcDbObject {
     this._pdsize = 0
     this._osmode = 0
     this._orthomode = 0
+    this._mirrtext = ACDB_MIRRTEXT_DEFAULT
+    this._filletrad = 0
+    this._chamfera = 0
+    this._chamferb = 0
+    this._chamferc = 0
+    this._chamferd = 0
     this._comparehatch = ACDB_COMPAREHATCH_DEFAULT
     this._comparercmargin = ACDB_COMPARERCMARGIN_DEFAULT
     this._comparetext = ACDB_COMPARETEXT_DEFAULT
@@ -2519,6 +2560,121 @@ export class AcDbDatabase extends AcDbObject {
   }
 
   /**
+   * Whether TEXT / MTEXT / ATTRIB are truly mirrored by MIRROR (**MIRRTEXT**).
+   *
+   * - `0`: keep text readable after mirror (AutoCAD default)
+   * - `1`: mirror text
+   *
+   * @see https://help.autodesk.com/view/ACD/2024/ENU/?guid=GUID-75AADC72-8BFA-4F42-BFD1-1852F3EE61DC
+   */
+  get mirrtext(): number {
+    return this._mirrtext
+  }
+  set mirrtext(value: number) {
+    const nextValue = acdbCoerceIntegerSysVar(
+      'MIRRTEXT',
+      value ?? ACDB_MIRRTEXT_DEFAULT,
+      ACDB_MIRRTEXT_MIN,
+      ACDB_MIRRTEXT_MAX
+    )
+    this.updateSysVar(
+      AcDbSystemVariables.MIRRTEXT,
+      this._mirrtext,
+      nextValue,
+      coerced => {
+        this._mirrtext = coerced
+      }
+    )
+  }
+
+  /**
+   * Current 2D fillet radius (**FILLETRAD**). Saved in the drawing.
+   *
+   * @see https://help.autodesk.com/cloudhelp/2025/ENU/AutoCAD-LT/files/GUID-BA2DD5FF-B663-48DB-95A8-6DEAFCEDDBF5.htm
+   */
+  get filletrad(): number {
+    return this._filletrad
+  }
+  set filletrad(value: number) {
+    this.updateSysVar(
+      AcDbSystemVariables.FILLETRAD,
+      this._filletrad,
+      value ?? 0,
+      nextValue => {
+        this._filletrad = nextValue
+      }
+    )
+  }
+
+  /**
+   * First chamfer distance when CHAMMODE is 0 (**CHAMFERA**).
+   */
+  get chamfera(): number {
+    return this._chamfera
+  }
+  set chamfera(value: number) {
+    this.updateSysVar(
+      AcDbSystemVariables.CHAMFERA,
+      this._chamfera,
+      value ?? 0,
+      nextValue => {
+        this._chamfera = nextValue
+      }
+    )
+  }
+
+  /**
+   * Second chamfer distance when CHAMMODE is 0 (**CHAMFERB**).
+   */
+  get chamferb(): number {
+    return this._chamferb
+  }
+  set chamferb(value: number) {
+    this.updateSysVar(
+      AcDbSystemVariables.CHAMFERB,
+      this._chamferb,
+      value ?? 0,
+      nextValue => {
+        this._chamferb = nextValue
+      }
+    )
+  }
+
+  /**
+   * Chamfer length when CHAMMODE is 1 (**CHAMFERC**).
+   */
+  get chamferc(): number {
+    return this._chamferc
+  }
+  set chamferc(value: number) {
+    this.updateSysVar(
+      AcDbSystemVariables.CHAMFERC,
+      this._chamferc,
+      value ?? 0,
+      nextValue => {
+        this._chamferc = nextValue
+      }
+    )
+  }
+
+  /**
+   * Chamfer angle in degrees when CHAMMODE is 1 (**CHAMFERD**).
+   */
+  get chamferd(): number {
+    return this._chamferd
+  }
+  set chamferd(value: number) {
+    this.updateSysVar(
+      AcDbSystemVariables.CHAMFERD,
+      this._chamferd,
+      value ?? 0,
+      nextValue => {
+        this._chamferd = nextValue
+      }
+    )
+  }
+
+  /**
    * Whether hatch objects are included in drawing comparison (**COMPAREHATCH**).
    *
    * - `0`: Hatch objects are excluded (AutoCAD default)
@@ -2910,6 +3066,10 @@ export class AcDbDatabase extends AcDbObject {
       outputFormat: options.format
     })
 
+    // Undo/redo restores entities and blocks from snapshots that may predate
+    // their association reactors; re-attach them before writing.
+    AcDbAssocManager.linkLoadedObjects(this)
+
     const objectsPlan = filer.capabilities.supportsObjectsSection
       ? this.planDxfObjectsSection(filer)
       : undefined
@@ -2917,7 +3077,7 @@ export class AcDbDatabase extends AcDbObject {
     this.ensureXDataAppIds(objectsPlan)
 
     this.writeDxfHeaderSection(filer)
-    this.writeDxfClassesSection(filer)
+    this.writeDxfClassesSection(filer, objectsPlan)
     this.writeDxfTablesSection(filer, outVersion)
     this.writeDxfBlocksSection(filer)
     this.writeDxfEntitiesSection(filer)
@@ -3598,6 +3758,18 @@ export class AcDbDatabase extends AcDbObject {
     filer.writeInt32(70, this.osmode)
     filer.writeString(9, '$ORTHOMODE')
     filer.writeInt16(70, this.orthomode)
+    filer.writeString(9, '$MIRRTEXT')
+    filer.writeInt16(70, this.mirrtext)
+    filer.writeString(9, '$FILLETRAD')
+    filer.writeDouble(40, this.filletrad)
+    filer.writeString(9, '$CHAMFERA')
+    filer.writeDouble(40, this.chamfera)
+    filer.writeString(9, '$CHAMFERB')
+    filer.writeDouble(40, this.chamferb)
+    filer.writeString(9, '$CHAMFERC')
+    filer.writeDouble(40, this.chamferc)
+    filer.writeString(9, '$CHAMFERD')
+    filer.writeDouble(40, this.chamferd)
     this.writeDxfHeaderExtras(filer)
     filer.endSection()
   }
@@ -3662,16 +3834,16 @@ export class AcDbDatabase extends AcDbObject {
    *
    * @param filer - DXF output writer.
    */
-  private writeDxfClassesSection(filer: AcDbDxfFiler) {
-    if (
-      !filer.capabilities.supportsClassesSection ||
-      this._classes.length === 0
-    ) {
-      return
-    }
+  private writeDxfClassesSection(
+    filer: AcDbDxfFiler,
+    objectsPlan?: AcDbDxfObjectsPlan
+  ) {
+    if (!filer.capabilities.supportsClassesSection) return
+    const classes = [...this._classes, ...this.missingDxfClasses(objectsPlan)]
+    if (classes.length === 0) return
 
     filer.startSection('CLASSES')
-    for (const dxfClass of this._classes) {
+    for (const dxfClass of classes) {
       filer.writeStart('CLASS')
       filer.writeString(1, dxfClass.name)
       filer.writeString(2, dxfClass.cppClassName)
@@ -3682,6 +3854,33 @@ export class AcDbDatabase extends AcDbObject {
       filer.writeInt8(281, dxfClass.isEntity ? 1 : 0)
     }
     filer.endSection()
+  }
+
+  /**
+   * CLASS entries AutoCAD requires for natively created custom objects that
+   * the drawing does not declare yet (e.g. associative-array records of a
+   * new drawing).
+   */
+  private missingDxfClasses(objectsPlan?: AcDbDxfObjectsPlan): AcDbClass[] {
+    if (!objectsPlan) return []
+    const declared = new Set(
+      this._classes.map(c => (c.name ?? '').toUpperCase())
+    )
+    const counts = new Map<string, number>()
+    for (const { type } of objectsPlan.records) {
+      const name = type.toUpperCase()
+      if (!ACDB_OBJECTDBX_CLASSES[name] || declared.has(name)) continue
+      counts.set(name, (counts.get(name) ?? 0) + 1)
+    }
+    return [...counts].map(([name, instanceCount]) => ({
+      name,
+      cppClassName: ACDB_OBJECTDBX_CLASSES[name],
+      appName: 'ObjectDBX Classes',
+      proxyFlag: 1025,
+      instanceCount,
+      wasProxy: false,
+      isEntity: false
+    }))
   }
 
   /**
@@ -3885,6 +4084,9 @@ export class AcDbDatabase extends AcDbObject {
       while (next < queue.length) {
         const object = queue[next++]
         visitExtensionDictionary(object)
+        for (const id of object.getHardOwnedObjectIds()) {
+          visit(this.getObjectById(id))
+        }
         if (object instanceof AcDbDictionary) {
           for (const [, entry] of object.entries()) visit(entry)
           if (object.defaultId) visit(this.getObjectById(object.defaultId))
@@ -3958,20 +4160,25 @@ export class AcDbDatabase extends AcDbObject {
       visit(layerIndex)
     }
     // Preserved records owned by an entity or object rather than a
-    // dictionary (e.g. IMAGEDEF_REACTOR) — kept while their owner exists.
-    for (const object of this._dxfUnknownObjects) {
-      const owner = this.getObjectById(object.ownerId)
-      // Kept while the owner is exported; a removed dictionary entry is not.
-      if (
-        owner instanceof AcDbEntity ||
-        (owner &&
-          !(owner instanceof AcDbDictionary) &&
-          records.has(norm(owner.objectId)))
-      ) {
-        visit(object)
+    // dictionary (e.g. IMAGEDEF_REACTOR, associative-framework records) —
+    // kept while their owner exists. Repeated until stable so a record that
+    // precedes its owner in the file is still kept.
+    for (let before = -1; before !== records.size; ) {
+      before = records.size
+      for (const object of this._dxfUnknownObjects) {
+        const owner = this.getObjectById(object.ownerId)
+        // Kept while the owner is exported; a removed dictionary entry is not.
+        if (
+          owner instanceof AcDbEntity ||
+          (owner &&
+            !(owner instanceof AcDbDictionary) &&
+            records.has(norm(owner.objectId)))
+        ) {
+          visit(object)
+        }
       }
+      drain()
     }
-    drain()
 
     // XRecords not owned by any written dictionary go to MLIGHT_XRECORD.
     const looseXrecords: AcDbXrecord[] = []

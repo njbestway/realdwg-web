@@ -1,5 +1,27 @@
 # @mlightcad/data-model
 
+## 1.16.3
+
+### Patch Changes
+
+- feat: adds AutoCAD-style FILLET and CHAMFER helpers with sysvars, preview, and polyarc support, plus ObjectARX-style AcDbCurve parameter, split and extend APIs for lines, arcs, circles, ellipses, polylines, rays, xlines and splines. Fixes AcGeEllipseArc3d bounding boxes for rotated full ellipses and makes line–circle/ellipse intersections detect tangency reliably at large coordinates
+- Updated dependencies
+  - @mlightcad/common@1.16.3
+  - @mlightcad/emf-converter@1.16.3
+  - @mlightcad/geometry-engine@3.16.3
+  - @mlightcad/graphic-interface@3.16.3
+
+## 1.16.2
+
+### Patch Changes
+
+- feat: adds AutoCAD-style AcDbEntity.joinEntity and joinEntities for joining entities, honors MIRRTEXT so mirrored TEXT and MTEXT stay readable when mirroring is enabled, and keeps OLE frames on the correct side after mirror transforms
+- Updated dependencies
+  - @mlightcad/common@1.16.2
+  - @mlightcad/emf-converter@1.16.2
+  - @mlightcad/geometry-engine@3.16.2
+  - @mlightcad/graphic-interface@3.16.2
+
 ## 1.16.1
 
 ### Patch Changes
