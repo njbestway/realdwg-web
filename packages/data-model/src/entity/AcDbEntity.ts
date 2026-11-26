@@ -89,6 +89,14 @@ export abstract class AcDbEntity extends AcDbObject {
    * after reading.
    */
   private _dxfCommonExtras?: AcDbTypedValue[]
+  /**
+   * The entity's original DWG handle (hex handle as a number), captured by the
+   * acad-rust native converter during the initial open mapping. Undefined for
+   * DXF-sourced and newly created entities. Route-B incremental DWG save
+   * addresses the source record through it; write-once so a later edit can
+   * never re-point an entity at another record.
+   */
+  private _dwgHandle?: number
 
   /**
    * Gets the type name of this entity.
@@ -619,6 +627,26 @@ export abstract class AcDbEntity extends AcDbObject {
   }
 
   /**
+   * The source DWG handle captured at open time, or undefined when the entity
+   * is not DWG-sourced (DXF import, newly created). Read-only provenance for
+   * the Route-B incremental save path.
+   */
+  get dwgHandle(): number | undefined {
+    return this._dwgHandle
+  }
+
+  /**
+   * @internal Write-once: the DWG converter sets it during the initial mapping;
+   * subsequent assignments are ignored so an edit can never re-point an entity
+   * at another source record.
+   */
+  set dwgHandle(value: number | undefined) {
+    if (this._dwgHandle === undefined) {
+      this._dwgHandle = value
+    }
+  }
+
+  /**
    * Resolves the effective properties of this entity.
    *
    * This method determines the final, usable values for entity properties such as
@@ -843,6 +871,25 @@ export abstract class AcDbEntity extends AcDbObject {
   // @ts-expect-error not use '_' prefix so that typedoc can the correct parameter to generate doc
   transformBy(matrix: AcGeMatrix3d): this {
     return this
+  }
+
+  /**
+   * A copy is a *new* entity: it must not claim the source DWG record of the
+   * original, so the provenance handle is dropped (the Route-B save journal
+   * would otherwise patch one source record from two live entities). Undo/redo
+   * snapshots keep it via {@link clonePreservingIdentity}.
+   */
+  override clone(): this {
+    const cloned = super.clone()
+    cloned._dwgHandle = undefined
+    return cloned
+  }
+
+  /** Undo/redo restores the same logical entity — keep its source handle. */
+  override clonePreservingIdentity(): this {
+    const cloned = super.clonePreservingIdentity()
+    cloned._dwgHandle = this._dwgHandle
+    return cloned
   }
 
   /**
