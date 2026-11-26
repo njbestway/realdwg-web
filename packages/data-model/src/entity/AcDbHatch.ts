@@ -6,6 +6,7 @@ import {
 } from '@mlightcad/common'
 import {
   AcGeArea2d,
+  type AcGeBoundaryEdgeType,
   AcGeBox3d,
   AcGeCircArc2d,
   AcGeEllipseArc2d,
@@ -31,6 +32,8 @@ import {
 } from '@mlightcad/graphic-interface'
 
 import { AcDbDxfFiler } from '../base/AcDbDxfFiler.js'
+import type { AcDbIdMapping } from '../base/AcDbIdMapping.js'
+import type { AcDbObjectId } from '../base/AcDbObject.js'
 import type { AcDbDatabase } from '../database/AcDbDatabase.js'
 import { AcDbSystemVariables } from '../database/AcDbSystemVariables.js'
 import { AcDbSysVarManager } from '../database/AcDbSysVarManager.js'
@@ -65,8 +68,10 @@ import {
 } from './AcDbEntityPropertyHelpers.js'
 import {
   acdbForEachGripIndex,
-  acdbMovePolyline2dVertexAt
+  acdbMovePolyline2dVertexAt,
+  acdbMoveStretchPointsViaGrips
 } from './AcDbGripHelpers.js'
+import { acdbHatchBoundaryEdgesFromEntity } from './acdbHatchBoundaryEdgesFromEntity.js'
 import { acdbTessellateHatchPattern } from './AcDbHatchPatternHelpers.js'
 import { acdbIntersectPrimitivesFromAreaLoops } from './AcDbIntersectHelpers.js'
 import { AcDbLine } from './AcDbLine.js'
@@ -245,6 +250,11 @@ export class AcDbHatch extends AcDbEntity {
   private _associative: boolean
   /** Whether associativity was assigned explicitly instead of coming from HPASSOC. */
   private _associativeSet: boolean
+  /**
+   * Per-boundary-path soft pointers to source boundary entities (DXF 97/330).
+   * Parallel to {@link _geo}.loops — one entry per path, possibly empty.
+   */
+  private _pathSourceIds: AcDbObjectId[][]
   /** Optional background color for hatch patterns. */
   private _backgroundColor?: AcCmColor
   /** Whether the background color was assigned explicitly instead of coming from HPBACKGROUNDCOLOR. */
@@ -257,6 +267,13 @@ export class AcDbHatch extends AcDbEntity {
   private _hatchStyle: AcDbHatchStyle
   /** Whether the hatch style was assigned explicitly instead of coming from HPISLANDDETECTION. */
   private _hatchStyleSet: boolean
+  /**
+   * Hatch pattern origin in the hatch OCS (WCS XY when the normal is +Z).
+   * Pattern definition-line bases are offset by this point when drawing/exporting.
+   */
+  private _originPoint: AcGePoint2d
+  /** Whether {@link originPoint} was assigned explicitly instead of from HPORIGIN. */
+  private _originPointSet: boolean
   /**
    * The current state of the gradient object.
    */
@@ -323,12 +340,15 @@ export class AcDbHatch extends AcDbEntity {
     this._patternScaleSet = false
     this._associative = false
     this._associativeSet = false
+    this._pathSourceIds = []
     this._backgroundColor = undefined
     this._backgroundColorSet = false
     this._patternDouble = false
     this._patternDoubleSet = false
     this._hatchStyle = AcDbHatchStyle.Normal
     this._hatchStyleSet = false
+    this._originPoint = new AcGePoint2d(0, 0)
+    this._originPointSet = false
     this._hatchObjectType = AcDbHatchObjectType.HatchObject
     this._gradientAngle = 0
     this._gradientShift = 0
@@ -494,6 +514,63 @@ export class AcDbHatch extends AcDbEntity {
   set associative(value: boolean) {
     this._associative = !!value
     this._associativeSet = true
+    this.notifyAssociationIndex()
+  }
+
+  /**
+   * Soft-pointer source object ids for every boundary path (DXF 97/330).
+   * Length matches {@link loops}.
+   */
+  get allPathSourceIds(): ReadonlyArray<ReadonlyArray<AcDbObjectId>> {
+    return this._pathSourceIds
+  }
+
+  /**
+   * Soft-pointer source object ids for the boundary path at `index`.
+   */
+  pathSourceIds(index: number): ReadonlyArray<AcDbObjectId> {
+    return this._pathSourceIds[index] ?? []
+  }
+
+  /**
+   * Replaces the source boundary soft-pointers for the path at `index`.
+   */
+  setPathSourceIds(index: number, ids: ReadonlyArray<AcDbObjectId>) {
+    if (index < 0 || index >= this._geo.loops.length) return
+    while (this._pathSourceIds.length < this._geo.loops.length) {
+      this._pathSourceIds.push([])
+    }
+    this._pathSourceIds[index] = ids.filter(id => !!id).map(id => String(id))
+    this.notifyAssociationIndex()
+  }
+
+  /**
+   * True when any path still lists at least one source boundary id.
+   */
+  hasAnyPathSourceIds(): boolean {
+    return this._pathSourceIds.some(ids => ids.length > 0)
+  }
+
+  /**
+   * Removes `boundaryId` from every path's source list. When no sources remain,
+   * clears the associative flag (geometry is kept).
+   */
+  removePathSourceId(boundaryId: AcDbObjectId) {
+    const id = String(boundaryId)
+    let changed = false
+    for (let i = 0; i < this._pathSourceIds.length; i++) {
+      const next = this._pathSourceIds[i].filter(sourceId => sourceId !== id)
+      if (next.length !== this._pathSourceIds[i].length) {
+        this._pathSourceIds[i] = next
+        changed = true
+      }
+    }
+    if (!changed) return
+    if (!this.hasAnyPathSourceIds()) {
+      this._associative = false
+      this._associativeSet = true
+    }
+    this.notifyAssociationIndex()
   }
 
   /**
@@ -527,6 +604,18 @@ export class AcDbHatch extends AcDbEntity {
   set hatchStyle(value: AcDbHatchStyle) {
     this._hatchStyle = value
     this._hatchStyleSet = true
+  }
+
+  /**
+   * Hatch pattern origin point (OCS XY). Aligns pattern generation like AutoCAD
+   * hatch origin / HPORIGIN.
+   */
+  get originPoint(): AcGePoint2d {
+    return this._originPoint
+  }
+  set originPoint(value: { x: number; y: number }) {
+    this._originPoint.set(value.x, value.y)
+    this._originPointSet = true
   }
 
   /**
@@ -780,6 +869,28 @@ export class AcDbHatch extends AcDbEntity {
       this._patternDoubleSet = true
     }
 
+    if (!this._originPointSet) {
+      const mode = manager.getVar(AcDbSystemVariables.HPORIGINMODE, db)
+      const modeNum = typeof mode === 'number' ? Math.trunc(mode) : 0
+      // Modes 1–5 need hatch boundary extents and are applied by the HATCH
+      // command after loops exist. Mode 0 uses the HPORIGIN session default.
+      if (modeNum === 0) {
+        const origin = manager.getVar(AcDbSystemVariables.HPORIGIN, db) as
+          | { x?: number; y?: number }
+          | undefined
+        if (
+          origin &&
+          typeof origin.x === 'number' &&
+          Number.isFinite(origin.x) &&
+          typeof origin.y === 'number' &&
+          Number.isFinite(origin.y)
+        ) {
+          this._originPoint.set(origin.x, origin.y)
+        }
+        this._originPointSet = true
+      }
+    }
+
     this.updatePredefinedPatternDefinitionLines()
   }
 
@@ -925,10 +1036,24 @@ export class AcDbHatch extends AcDbEntity {
    * pattern angle included. Lines expanded from the bundled PAT library do
    * not carry the entity pattern angle yet (renderers add it), so it is
    * applied here; explicit lines already include it.
+   *
+   * Hatch origin is applied as AutoCAD does: `origin + R(angle) * base`
+   * (rotate pattern-relative bases, then translate by {@link originPoint}).
    */
   private getDxfDefinitionLines(patternAngle: number) {
+    const ox = this._originPoint.x
+    const oy = this._originPoint.y
+    const withOrigin = (line: AcGiHatchPatternLine): AcGiHatchPatternLine => ({
+      angle: line.angle,
+      base: { x: line.base.x + ox, y: line.base.y + oy },
+      offset: line.offset,
+      dashLengths: line.dashLengths
+    })
     if (!this._definitionLinesAutoGenerated || patternAngle === 0) {
-      return this._definitionLines
+      if (ox === 0 && oy === 0) {
+        return this._definitionLines
+      }
+      return this._definitionLines.map(withOrigin)
     }
     const cos = Math.cos(patternAngle)
     const sin = Math.sin(patternAngle)
@@ -936,12 +1061,39 @@ export class AcDbHatch extends AcDbEntity {
       x: p.x * cos - p.y * sin,
       y: p.x * sin + p.y * cos
     })
-    return this._definitionLines.map(line => ({
-      angle: line.angle + patternAngle,
-      base: rotate(line.base),
-      offset: rotate(line.offset),
-      dashLengths: line.dashLengths
-    }))
+    return this._definitionLines.map(line => {
+      const rotated = {
+        angle: line.angle + patternAngle,
+        base: rotate(line.base),
+        offset: rotate(line.offset),
+        dashLengths: line.dashLengths
+      }
+      return withOrigin(rotated)
+    })
+  }
+
+  /**
+   * Definition lines + pattern angle for render / explode.
+   *
+   * Tessellators rotate each line base by `patternAngle`. AutoCAD places
+   * bases as `origin + R(angle) * base`, so a non-zero {@link originPoint}
+   * must be applied after that rotation. When both are non-zero, bake the
+   * angle into the lines (same as DXF) and return `patternAngle: 0`.
+   */
+  private getRenderablePatternLines(): {
+    definitionLines: AcGiHatchPatternLine[]
+    patternAngle: number
+  } {
+    const patternAngle = this.getRenderablePatternAngle()
+    const ox = this._originPoint.x
+    const oy = this._originPoint.y
+    if (ox === 0 && oy === 0) {
+      return { definitionLines: this.definitionLines, patternAngle }
+    }
+    return {
+      definitionLines: this.getDxfDefinitionLines(patternAngle),
+      patternAngle: 0
+    }
   }
 
   /**
@@ -1023,13 +1175,175 @@ export class AcDbHatch extends AcDbEntity {
   }
 
   /**
+   * Boundary loops of this hatch (outer first, then holes).
+   */
+  get loops() {
+    return this._geo.loops
+  }
+
+  /**
    * Append one loop to loops of this area. If it is the first loop added, it is the outter loop.
    * Otherwise, it is an inner loop.
    * @param loop Input the loop to append
    */
   add(loop: AcGeLoop2dType) {
     this._geo.add(loop)
+    this._pathSourceIds.push([])
     this.invalidateAreasFromLoopsCache()
+  }
+
+  /**
+   * Removes every boundary loop and its path source soft-pointers.
+   */
+  clearLoops() {
+    this._geo.clear()
+    this._pathSourceIds = []
+    this.invalidateAreasFromLoopsCache()
+    this.notifyAssociationIndex()
+  }
+
+  /**
+   * Replaces all boundary loops. Path source ids are cleared unless
+   * `pathSourceIds` is provided with one entry per loop.
+   */
+  setLoops(
+    loops: ReadonlyArray<AcGeLoop2dType>,
+    pathSourceIds?: ReadonlyArray<ReadonlyArray<AcDbObjectId>>
+  ) {
+    this._geo.clear()
+    this._pathSourceIds = []
+    loops.forEach((loop, index) => {
+      this._geo.add(loop)
+      const sources = pathSourceIds?.[index] ?? []
+      this._pathSourceIds.push(sources.filter(id => !!id).map(id => String(id)))
+    })
+    this.invalidateAreasFromLoopsCache()
+    this.notifyAssociationIndex()
+  }
+
+  /**
+   * Rebuilds boundary loops from live source boundary entities referenced by
+   * {@link allPathSourceIds}. No-op when the hatch is non-associative or has
+   * no source soft-pointers. Pattern / style properties are preserved.
+   *
+   * @returns `true` when loops were replaced.
+   */
+  rebuildLoopsFromSources(): boolean {
+    if (!this.associative || !this.hasAnyPathSourceIds()) {
+      return false
+    }
+    const database = this.database
+    if (!database) return false
+
+    const rebuiltLoops: AcGeLoop2dType[] = []
+    const rebuiltSources: AcDbObjectId[][] = []
+
+    for (let i = 0; i < this._pathSourceIds.length; i++) {
+      const sourceIds = this._pathSourceIds[i] ?? []
+      if (sourceIds.length === 0) {
+        // Keep prior geometry for paths that lost all sources.
+        const existing = this._geo.loops[i]
+        if (existing) {
+          rebuiltLoops.push(existing.clone())
+          rebuiltSources.push([])
+        }
+        continue
+      }
+
+      const edges: AcGeBoundaryEdgeType[] = []
+      const resolvedIds: AcDbObjectId[] = []
+      for (const id of sourceIds) {
+        const object = database.getObjectById(id)
+        if (!(object instanceof AcDbEntity)) continue
+        const entityEdges = acdbHatchBoundaryEdgesFromEntity(object)
+        if (entityEdges.length === 0) continue
+        edges.push(...entityEdges)
+        resolvedIds.push(id)
+      }
+
+      if (edges.length === 0) {
+        const existing = this._geo.loops[i]
+        if (existing) {
+          rebuiltLoops.push(existing.clone())
+          rebuiltSources.push([])
+        }
+        continue
+      }
+
+      const loop = this.buildLoopFromEdges(edges)
+      if (!loop) {
+        const existing = this._geo.loops[i]
+        if (existing) {
+          rebuiltLoops.push(existing.clone())
+          rebuiltSources.push(resolvedIds)
+        }
+        continue
+      }
+      rebuiltLoops.push(loop)
+      rebuiltSources.push(resolvedIds)
+    }
+
+    if (rebuiltLoops.length === 0) return false
+
+    this._geo.clear()
+    this._pathSourceIds = []
+    rebuiltLoops.forEach((loop, index) => {
+      this._geo.add(loop)
+      this._pathSourceIds.push(rebuiltSources[index] ?? [])
+    })
+    if (!this.hasAnyPathSourceIds()) {
+      this._associative = false
+      this._associativeSet = true
+    }
+    this.invalidateAreasFromLoopsCache()
+    this.notifyAssociationIndex()
+    return true
+  }
+
+  /**
+   * Translates path-source soft-pointers after a deep clone / wblock.
+   */
+  override translateClonedReferences(idMap: AcDbIdMapping): void {
+    super.translateClonedReferences(idMap)
+    this._pathSourceIds = this._pathSourceIds.map(sources =>
+      sources
+        .map(id => idMap.translateId(id) ?? '')
+        .filter(id => id.length > 0)
+    )
+    if (!this.hasAnyPathSourceIds() && this._associative) {
+      this._associative = false
+      this._associativeSet = true
+    }
+    this.notifyAssociationIndex()
+  }
+
+  private buildLoopFromEdges(
+    edges: ReadonlyArray<AcGeBoundaryEdgeType>
+  ): AcGeLoop2dType | undefined {
+    const tolerances = [1e-6, 1e-5, 1e-4, 1e-3]
+    let best: AcGeLoop2d[] = []
+    for (const tolerance of tolerances) {
+      const loops = AcGeLoop2d.buildFromEdges(edges, tolerance).filter(
+        loop => loop.closed && loop.numberOfEdges > 0
+      )
+      if (loops.length > best.length) {
+        best = loops
+      }
+      if (loops.length === 1) {
+        return loops[0]
+      }
+    }
+    if (best.length === 1) return best[0]
+    if (edges.length > 0) return new AcGeLoop2d([...edges])
+    return undefined
+  }
+
+  private notifyAssociationIndex() {
+    // Only notify when this hatch is bound to a database. Accessing
+    // {@link database} before bind falls back to the working database and
+    // can throw when none is set (e.g. constructing an unbound hatch).
+    const database = (this as unknown as { _database?: AcDbDatabase })._database
+    database?.hatchAssociationIndex?.refresh(this)
   }
 
   private invalidateAreasFromLoopsCache() {
@@ -1458,6 +1772,16 @@ export class AcDbHatch extends AcDbEntity {
     this.invalidateAreasFromLoopsCache()
     return this
   }
+  /**
+   * Local stretch: move selected stretch points via grip editing.
+   */
+  override subMoveStretchPointsAt(
+    indices: number[],
+    offset: AcGeVector3dLike
+  ) {
+    return acdbMoveStretchPointsViaGrips(this, indices, offset)
+  }
+
 
   /**
    * Collects editable grip points from hatch boundary loops.
@@ -1962,11 +2286,12 @@ export class AcDbHatch extends AcDbEntity {
     this._patternScaleSet = true
     try {
       this.updatePredefinedPatternDefinitionLines()
+      const { definitionLines, patternAngle } = this.getRenderablePatternLines()
       const traits = renderer.subEntityTraits
       traits.fillType = {
         solidFill: this.isSolidFill,
-        patternAngle: this.getRenderablePatternAngle(),
-        definitionLines: this.definitionLines,
+        patternAngle,
+        definitionLines,
         backgroundColor: this.backgroundColor?.clone(),
         gradient: this.isGradient
           ? {
@@ -2031,9 +2356,8 @@ export class AcDbHatch extends AcDbEntity {
     this._patternScaleSet = true
     try {
       this.updatePredefinedPatternDefinitionLines()
-      const definitionLines = this.definitionLines
+      const { definitionLines, patternAngle } = this.getRenderablePatternLines()
       if (definitionLines.length === 0) return undefined
-      const patternAngle = this.getRenderablePatternAngle()
       const options = acdbDrawTessellateOptions({
         context: { database: this.database }
       })
@@ -2093,6 +2417,7 @@ export class AcDbHatch extends AcDbEntity {
     if (this._normal.lengthSq() > 0) {
       this._normal.normalize()
     }
+    this._originPoint.applyMatrix2d(matrix2d)
 
     const xAxis = new AcGePoint3d(1, 0, 0).applyMatrix4(matrix)
     const origin = new AcGePoint3d().applyMatrix4(matrix)
@@ -2145,6 +2470,19 @@ export class AcDbHatch extends AcDbEntity {
   }
 
   /**
+   * Writes path-level source-boundary count (97) and soft pointers (330).
+   */
+  private writePathSourceIds(
+    filer: AcDbDxfFiler,
+    sources: ReadonlyArray<AcDbObjectId>
+  ) {
+    filer.writeInt16(97, sources.length)
+    for (const id of sources) {
+      filer.writeObjectId(330, id)
+    }
+  }
+
+  /**
    * Writes DXF fields for this object.
    *
    * @param filer - DXF output writer.
@@ -2170,6 +2508,7 @@ export class AcDbHatch extends AcDbEntity {
     filer.writeInt16(91, loops.length)
     loops.forEach((loop, index) => {
       const isExternal = index === 0
+      const pathSources = this._pathSourceIds[index] ?? []
 
       if (loop instanceof AcGePolyline2d) {
         const vertices = loop.vertices
@@ -2186,7 +2525,7 @@ export class AcDbHatch extends AcDbEntity {
             filer.writeDouble(42, vertex.bulge ?? 0)
           }
         }
-        filer.writeInt16(97, 0)
+        this.writePathSourceIds(filer, pathSources)
         return
       }
 
@@ -2273,7 +2612,7 @@ export class AcDbHatch extends AcDbEntity {
           }
         }
 
-        filer.writeInt16(97, 0)
+        this.writePathSourceIds(filer, pathSources)
       }
     })
     filer.writeInt16(75, this.hatchStyle)
@@ -2401,6 +2740,9 @@ export class AcDbHatch extends AcDbEntity {
     let afterBoundaries = false
     let gradientColorIndex = 0
     let pendingGradientAci: number | undefined
+    /** Remaining source-boundary soft-pointers (330) for the path just flushed. */
+    let pendingSourceCount = 0
+    let pendingSourcePathIndex = -1
 
     const applyGradientRgb = (rgb: number) => {
       if (gradientColorIndex === 0) {
@@ -2545,17 +2887,45 @@ export class AcDbHatch extends AcDbEntity {
     }
 
     /**
-     * End the current boundary path (source-boundary count / next path).
-     * Matches dxf-json: spline edge owns its own group 97 (fit count); the
-     * following group 97 is the path-level source-boundary object count.
+     * Finish the current path after geometry (and optional 330 sources) are in.
      */
-    const endCurrentPath = () => {
-      commitCurrentEdge()
-      flushCurrentLoop()
+    const finishPathAfterSources = () => {
+      pendingSourceCount = 0
+      pendingSourcePathIndex = -1
       loopsRemaining = Math.max(0, loopsRemaining - 1)
       if (loopsRemaining === 0) {
         afterBoundaries = true
       }
+    }
+
+    /**
+     * End the current boundary path (source-boundary count / next path).
+     * Matches dxf-json: spline edge owns its own group 97 (fit count); the
+     * following group 97 is the path-level source-boundary object count.
+     * When that count is non-zero, geometry is flushed first and subsequent
+     * group-330 soft pointers are collected before finishing the path.
+     */
+    const beginPathSourceCollection = (sourceCount: number) => {
+      const loopCountBefore = this._geo.loops.length
+      commitCurrentEdge()
+      flushCurrentLoop()
+      const pathIndex = this._geo.loops.length - 1
+      // Only attach soft-pointers when this path actually produced a loop.
+      // An empty path must not steal the previous path's index.
+      if (
+        sourceCount > 0 &&
+        pathIndex >= 0 &&
+        this._geo.loops.length > loopCountBefore
+      ) {
+        pendingSourceCount = sourceCount
+        pendingSourcePathIndex = pathIndex
+        while (this._pathSourceIds.length <= pathIndex) {
+          this._pathSourceIds.push([])
+        }
+        this._pathSourceIds[pathIndex] = []
+        return
+      }
+      finishPathAfterSources()
     }
 
     while (!filer.atEndOfObject && !filer.atEof && !filer.atExtendedData) {
@@ -2932,9 +3302,30 @@ export class AcDbHatch extends AcDbEntity {
             currentEdge.fitCountSeen = true
             break
           }
-          endCurrentPath()
+          beginPathSourceCollection(Math.max(0, n))
+          break
+        case 330:
+          // Path-level soft pointers to source boundary objects. Only valid
+          // while collecting after a non-zero path-level group 97.
+          if (pendingSourceCount > 0 && pendingSourcePathIndex >= 0) {
+            const handle = String(item.value ?? '')
+            if (handle) {
+              this._pathSourceIds[pendingSourcePathIndex].push(handle)
+            }
+            pendingSourceCount--
+            if (pendingSourceCount === 0) {
+              finishPathAfterSources()
+            }
+            break
+          }
           break
         case 75:
+          // Pattern section begins. If we were still collecting path-source
+          // soft-pointers, finish that path first so loopsRemaining stays
+          // consistent even when the DXF omits some 330s.
+          if (pendingSourceCount > 0) {
+            finishPathAfterSources()
+          }
           commitCurrentEdge()
           flushCurrentLoop()
           loopsRemaining = 0
@@ -2970,6 +3361,7 @@ export class AcDbHatch extends AcDbEntity {
       this.normal = extrusion
     }
     this.patternAngle = (patternAngleDeg * Math.PI) / 180
+    this.notifyAssociationIndex()
     return this
   }
 }
